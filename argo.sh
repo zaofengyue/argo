@@ -167,6 +167,7 @@ quick_install_wizard() {
     [[ -z "$(get_env "ARGO_AUTH")" ]] && set_env "ARGO_AUTH" ""
     [[ -z "$(get_env "CF_PREFER_HOST")" ]] && set_env "CF_PREFER_HOST" "www.visa.com.tw"
     [[ -z "$(get_env "SUB")" ]] && set_env "SUB" "sub"
+    [[ -z "$(get_env "LOG_CLEAR_MINUTES")" ]] && set_env "LOG_CLEAR_MINUTES" "0"
 
     log_info "基础参数已配置完毕！高级项可在“修改配置”菜单中随时调整。"
 }
@@ -176,7 +177,7 @@ config_menu() {
     local modified=0
     while true; do
         clear
-        local cur_uuid cur_pwd cur_port cur_name cur_domain cur_auth cur_cf cur_tg_token cur_tg_chat cur_km_domain cur_km_token
+        local cur_uuid cur_pwd cur_port cur_name cur_domain cur_auth cur_cf cur_km_domain cur_km_token
         cur_uuid=$(get_env "UUID")
         [[ -z "$cur_uuid" ]] && cur_uuid="a982ac5f-9acd-4d38-9140-56f0b27c6961"
         cur_pwd=$(get_env "PASSWORD")
@@ -196,11 +197,6 @@ config_menu() {
         cur_cf=$(get_env "CF_PREFER_HOST")
         [[ -z "$cur_cf" ]] && cur_cf="www.visa.com.tw"
 
-        cur_tg_token=$(get_env "TG_BOT_TOKEN")
-        cur_tg_chat=$(get_env "TG_CHAT_ID")
-        local cur_tg="未配置"
-        [[ -n "$cur_tg_token" && -n "$cur_tg_chat" ]] && cur_tg="已配置"
-
         cur_km_domain=$(get_env "KOMARI_DOMAIN")
         cur_km_token=$(get_env "KOMARI_TOKEN")
         local cur_km="未配置"
@@ -216,12 +212,11 @@ config_menu() {
         echo -e " ${GREEN}5.${NC} Argo 固定域名  : ${CYAN}${cur_domain}${NC}"
         echo -e " ${GREEN}6.${NC} Argo 隧道凭证  : ${CYAN}${cur_auth}${NC}"
         echo -e " ${GREEN}7.${NC} CF 优选域名    : ${CYAN}${cur_cf}${NC}"
-        echo -e " ${GREEN}8.${NC} TG 推送设置    : ${CYAN}${cur_tg}${NC}"
-        echo -e " ${GREEN}9.${NC} Komari 探针    : ${CYAN}${cur_km}${NC}"
+        echo -e " ${GREEN}8.${NC} Komari 探针    : ${CYAN}${cur_km}${NC}"
         echo -e "${CYAN}----------------------------------------------------${NC}"
         echo -e " ${WHITE}0.${NC} 返回主菜单"
         echo -e "${CYAN}====================================================${NC}"
-        read -rp "请输入要修改的配置项 [0-9]: " cfg_choice
+        read -rp "请输入要修改的配置项 [0-8]: " cfg_choice
 
         case "$cfg_choice" in
             1)
@@ -293,20 +288,6 @@ config_menu() {
                 fi
                 ;;
             8)
-                echo -e "\n当前 TG 推送: ${GREEN}${cur_tg}${NC}"
-                read -rp "请输入 TG_BOT_TOKEN (输入 'none' 关闭推送，留空保持原值): " new_bot
-                if [[ "$new_bot" == "none" ]]; then
-                    set_env "TG_BOT_TOKEN" ""
-                    set_env "TG_CHAT_ID" ""
-                    modified=1
-                elif [[ -n "$new_bot" ]]; then
-                    read -rp "请输入 TG_CHAT_ID: " new_chat
-                    set_env "TG_BOT_TOKEN" "$new_bot"
-                    set_env "TG_CHAT_ID" "$new_chat"
-                    modified=1
-                fi
-                ;;
-            9)
                 echo -e "\n当前 Komari 探针: ${GREEN}${cur_km}${NC}"
                 read -rp "请输入 Komari 服务端域名 (输入 'none' 关闭探针，留空保持原值): " new_domain
                 if [[ "$new_domain" == "none" ]]; then
@@ -329,7 +310,7 @@ config_menu() {
                 break
                 ;;
             *)
-                log_error "无效选项，请输入 0-9 之间的数字！"
+                log_error "无效选项，请输入 0-8 之间的数字！"
                 sleep 1
                 ;;
         esac
@@ -570,7 +551,7 @@ show_help() {
     echo -e " ${GREEN}argo status${NC}        - 查看服务运行状态、PID 与内存占用"
     echo -e " ${GREEN}argo sub${NC}           - 查看节点连接链接与 Base64 订阅内容"
     echo -e " ${GREEN}argo log${NC}           - 实时查看服务运行日志 (按 Ctrl+C 退出)"
-    echo -e " ${GREEN}argo edit${NC}          - 修改核心参数 (UUID/密码/端口/隧道Token/TG推送)"
+    echo -e " ${GREEN}argo edit${NC}          - 修改核心参数 (UUID/密码/端口/隧道Token/CF优选)"
     echo -e " ${GREEN}argo update${NC}        - 一键检查并拉取更新服务端到最新版"
     echo -e " ${RED}argo uninstall${NC}     - 彻底卸载 Argo 服务与所有配置文件"
     echo -e " ${GREEN}argo help${NC}          - 显示本命令行帮助目录"
