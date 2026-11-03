@@ -59,9 +59,10 @@ const TG_BOT_TOKEN    = (PRESET_TG_BOT_TOKEN      || process.env.TG_BOT_TOKEN   
 const TG_CHAT_ID      = (PRESET_TG_CHAT_ID        || process.env.TG_CHAT_ID        || '').trim();
 
 // ── 协议挂载路径（固定默认标准路径）─────────────────────────────────────────
-const PATH_XHTTP      = '/vless-xhttp';
-const PATH_VLESS      = '/vless-ws';
-const PATH_TROJAN     = '/trojan-ws';
+const PATH_XHTTP        = '/vless-xhttp';
+const PATH_VLESS        = '/vless-ws';
+const PATH_TROJAN_XHTTP = '/trojan-xhttp';
+const PATH_TROJAN       = '/trojan-ws';
 
 // ── 全局运行与进程防杀状态 ───────────────────────────────────────────────────
 const trackedProcesses = [];
@@ -293,14 +294,15 @@ function parseTrojanHeader(buffer) {
   };
 }
 
-// ── 节点链接生成器（仅保留原生高能 3 协议，名称仅 国家+运营商）───────────────
+// ── 节点链接生成器（原生高能 4 组合，名称仅 国家+运营商）───────────────────
 function generateNodeLinks(host, preferHost) {
   const remark = encodeURIComponent(NODE_NAME || 'argo');
-  const vlessXhttp = `vless://${UUID}@${preferHost}:443?encryption=none&security=tls&type=xhttp&host=${host}&path=${encodeURIComponent(PATH_XHTTP)}&sni=${host}#${remark}`;
-  const vlessWs    = `vless://${UUID}@${preferHost}:443?encryption=none&security=tls&type=ws&host=${host}&path=${encodeURIComponent(PATH_VLESS)}&sni=${host}#${remark}`;
-  const trojanWs   = `trojan://${PASSWORD}@${preferHost}:443?security=tls&type=ws&host=${host}&path=${encodeURIComponent(PATH_TROJAN)}&sni=${host}#${remark}`;
+  const vlessXhttp  = `vless://${UUID}@${preferHost}:443?encryption=none&security=tls&type=xhttp&host=${host}&path=${encodeURIComponent(PATH_XHTTP)}&sni=${host}#${remark}`;
+  const vlessWs     = `vless://${UUID}@${preferHost}:443?encryption=none&security=tls&type=ws&host=${host}&path=${encodeURIComponent(PATH_VLESS)}&sni=${host}#${remark}`;
+  const trojanXhttp = `trojan://${PASSWORD}@${preferHost}:443?security=tls&type=xhttp&host=${host}&path=${encodeURIComponent(PATH_TROJAN_XHTTP)}&sni=${host}#${remark}`;
+  const trojanWs    = `trojan://${PASSWORD}@${preferHost}:443?security=tls&type=ws&host=${host}&path=${encodeURIComponent(PATH_TROJAN)}&sni=${host}#${remark}`;
 
-  return [vlessXhttp, vlessWs, trojanWs];
+  return [vlessXhttp, vlessWs, trojanXhttp, trojanWs];
 }
 
 // ── 1. HTTP 基础服务（Web 伪装、Base64 订阅与 xhttp 分块引擎）────────────────
@@ -382,7 +384,65 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // ③ 根路径展示静态海边日记伪装博客
+  // ③ Trojan + xhttp (SplitHTTP) 原生全双工流引擎（带防探测与背压保护）
+  if (reqUrl === PATH_TROJAN_XHTTP && req.method === 'POST') {
+    let isParsed = false;
+    let remoteSocket = null;
+    const chunksQueue = [];
+
+    req.on('data', (chunk) => {
+      if (!isParsed) {
+        chunksQueue.push(chunk);
+        const fullBuf = Buffer.concat(chunksQueue);
+
+        if (fullBuf.length > 2048) {
+          res.writeHead(400, { 'Content-Type': 'text/plain' });
+          res.end('Bad Request');
+          req.destroy();
+          return;
+        }
+
+        const parsed = parseTrojanHeader(fullBuf);
+        if (parsed) {
+          isParsed = true;
+          remoteSocket = net.connect({ host: parsed.targetHost, port: parsed.targetPort }, () => {
+            res.writeHead(200, {
+              'Content-Type': 'application/octet-stream',
+              'Transfer-Encoding': 'chunked',
+              'Cache-Control': 'no-cache, no-store',
+              'Connection': 'keep-alive'
+            });
+            if (parsed.payload.length > 0) remoteSocket.write(parsed.payload);
+
+            remoteSocket.on('data', (d) => {
+              if (!res.write(d)) {
+                remoteSocket.pause();
+              }
+            });
+            res.on('drain', () => remoteSocket.resume());
+            remoteSocket.on('close', () => res.end());
+            remoteSocket.on('error', () => res.end());
+          });
+          remoteSocket.on('error', () => res.destroy());
+        }
+      } else {
+        if (remoteSocket && !remoteSocket.destroyed) remoteSocket.write(chunk);
+      }
+    });
+
+    req.on('end', () => {
+      if (!isParsed) {
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        res.end('Bad Request');
+      } else if (remoteSocket && !remoteSocket.destroyed) {
+        remoteSocket.end();
+      }
+    });
+    req.on('error', () => { if (remoteSocket) remoteSocket.destroy(); });
+    return;
+  }
+
+  // ④ 根路径展示静态海边日记伪装博客
   if (reqUrl === '/' || reqUrl === '/index.html') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     return res.end(CAMOUFLAGE_HTML);
@@ -600,6 +660,7 @@ function displayNodeInfo(host) {
     console.log(`============== 已启用协议 ==============`);
     console.log(`✓ VLESS  + xhttp + Argo TLS`);
     console.log(`✓ VLESS  + WS    + Argo TLS`);
+    console.log(`✓ Trojan + xhttp + Argo TLS`);
     console.log(`✓ Trojan + WS    + Argo TLS`);
     console.log(`========================================\n`);
 

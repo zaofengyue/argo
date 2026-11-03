@@ -17,10 +17,11 @@
    - 支持 **临时穿透隧道**（开箱即用，动态解析）与 **固定 Token 隧道**（稳定域名）。
    - 固定隧道 Token 采用系统环境变量传递，不在 CLI 命令行暴露，避免 `ps aux` 敏感凭证泄露。
 
-3. **3 大原生高能协议矩阵**
+3. **4 大原生高能协议矩阵**
    - `VLESS + xhttp + Argo TLS`（最新 SplitHTTP 流式全双工传输，带 2KB 头部防探测保护）
    - `VLESS + WS + Argo TLS`（经典通用高兼容 WebSocket）
-   - `Trojan + WS + Argo TLS`（高隐蔽 Trojan 流量）
+   - `Trojan + xhttp + Argo TLS`（Trojan 密码体系 + SplitHTTP 分块流）
+   - `Trojan + WS + Argo TLS`（经典密码体系高隐蔽 Trojan 流量）
 
 4. **双向保活守护与反查杀**
    - 内置守护保活引擎，支持指数退避重启（3s ~ 60s），被平台意外杀死后自动拉起。

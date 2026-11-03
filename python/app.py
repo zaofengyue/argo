@@ -64,9 +64,10 @@ TG_BOT_TOKEN    = (PRESET_TG_BOT_TOKEN      or os.environ.get('TG_BOT_TOKEN')   
 TG_CHAT_ID      = (PRESET_TG_CHAT_ID        or os.environ.get('TG_CHAT_ID')        or '').strip()
 
 # ── 协议挂载路径（固定默认标准路径）─────────────────────────────────────────
-PATH_XHTTP      = '/vless-xhttp'
-PATH_VLESS      = '/vless-ws'
-PATH_TROJAN     = '/trojan-ws'
+PATH_XHTTP        = '/vless-xhttp'
+PATH_VLESS        = '/vless-ws'
+PATH_TROJAN_XHTTP = '/trojan-xhttp'
+PATH_TROJAN       = '/trojan-ws'
 
 # ── 全局运行与进程防杀状态 ───────────────────────────────────────────────────
 tracked_processes = []
@@ -314,18 +315,20 @@ def parse_trojan_header(buf: bytes):
         'payload': buf[cursor:]
     }
 
-# ── 节点链接生成器（仅保留原生高能 3 协议，名称仅 国家+运营商）───────────────
+# ── 节点链接生成器（原生高能 4 组合，名称仅 国家+运营商）───────────────────
 def generate_node_links(host: str, prefer_host: str) -> list[str]:
     remark = urllib.parse.quote(NODE_NAME or 'argo')
     path_xhttp = urllib.parse.quote(PATH_XHTTP)
     path_vless = urllib.parse.quote(PATH_VLESS)
+    path_trojan_xhttp = urllib.parse.quote(PATH_TROJAN_XHTTP)
     path_trojan = urllib.parse.quote(PATH_TROJAN)
 
-    vless_xhttp = f"vless://{UUID}@{prefer_host}:443?encryption=none&security=tls&type=xhttp&host={host}&path={path_xhttp}&sni={host}#{remark}"
-    vless_ws    = f"vless://{UUID}@{prefer_host}:443?encryption=none&security=tls&type=ws&host={host}&path={path_vless}&sni={host}#{remark}"
-    trojan_ws   = f"trojan://{PASSWORD}@{prefer_host}:443?security=tls&type=ws&host={host}&path={path_trojan}&sni={host}#{remark}"
+    vless_xhttp  = f"vless://{UUID}@{prefer_host}:443?encryption=none&security=tls&type=xhttp&host={host}&path={path_xhttp}&sni={host}#{remark}"
+    vless_ws     = f"vless://{UUID}@{prefer_host}:443?encryption=none&security=tls&type=ws&host={host}&path={path_vless}&sni={host}#{remark}"
+    trojan_xhttp = f"trojan://{PASSWORD}@{prefer_host}:443?security=tls&type=xhttp&host={host}&path={path_trojan_xhttp}&sni={host}#{remark}"
+    trojan_ws    = f"trojan://{PASSWORD}@{prefer_host}:443?security=tls&type=ws&host={host}&path={path_trojan}&sni={host}#{remark}"
 
-    return [vless_xhttp, vless_ws, trojan_ws]
+    return [vless_xhttp, vless_ws, trojan_xhttp, trojan_ws]
 
 # ── Telegram 推送函数 ────────────────────────────────────────────────────────
 def escape_html(s: str) -> str:
@@ -434,6 +437,7 @@ def display_node_info(host: str):
         print(f"============== 已启用协议 ==============")
         print(f"✓ VLESS  + xhttp + Argo TLS")
         print(f"✓ VLESS  + WS    + Argo TLS")
+        print(f"✓ Trojan + xhttp + Argo TLS")
         print(f"✓ Trojan + WS    + Argo TLS")
         print(f"========================================\n")
 
@@ -695,6 +699,62 @@ async def handle_xhttp(request):
     })
     await resp.prepare(request)
     await resp.write(b'\x00\x00') # VLESS 握手成功响应
+
+    if parsed['payload']:
+        r_writer.write(parsed['payload'])
+        await r_writer.drain()
+
+    async def pipe_req_to_remote():
+        try:
+            while True:
+                chunk = await content.readany()
+                if not chunk:
+                    break
+                r_writer.write(chunk)
+                await r_writer.drain()
+        except Exception:
+            pass
+        finally:
+            try:
+                r_writer.close()
+                await r_writer.wait_closed()
+            except Exception:
+                pass
+
+    async def pipe_remote_to_resp():
+        try:
+            while True:
+                data = await r_reader.read(65536)
+                if not data:
+                    break
+                await resp.write(data)
+        except Exception:
+            pass
+
+    await asyncio.gather(pipe_req_to_remote(), pipe_remote_to_resp())
+    return resp
+
+@routes.post(PATH_TROJAN_XHTTP)
+async def handle_trojan_xhttp(request):
+    # Trojan + xhttp (SplitHTTP) 原生全双工流（带 2KB 头部防探测保护）
+    content = request.content
+    first_chunk = await content.read(2048)
+    parsed = parse_trojan_header(first_chunk)
+    if not parsed:
+        return web.Response(status=400, text="Bad Request")
+
+    try:
+        r_reader, r_writer = await asyncio.open_connection(parsed['target_host'], parsed['target_port'])
+    except Exception:
+        return web.Response(status=502)
+
+    resp = web.StreamResponse(status=200, headers={
+        'Content-Type': 'application/octet-stream',
+        'Transfer-Encoding': 'chunked',
+        'Cache-Control': 'no-cache, no-store',
+        'Connection': 'keep-alive'
+    })
+    await resp.prepare(request)
 
     if parsed['payload']:
         r_writer.write(parsed['payload'])
