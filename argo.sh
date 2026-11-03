@@ -435,12 +435,73 @@ quick_install_wizard() {
     log_info "基础参数已配置完毕！"
 }
 
+# ── TCP BBR 加速管理 ──────────────────────────────────────────────────────────
+get_bbr_status() {
+    local cc
+    cc=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)
+    if [[ "$cc" == "bbr" ]]; then
+        echo "已开启 (BBR)"
+    elif [[ -n "$cc" ]]; then
+        echo "未开启 (${cc})"
+    else
+        echo "未知"
+    fi
+}
+
+manage_bbr() {
+    echo -e "\n${CYAN}================= 🚀 TCP BBR 拥塞控制管理 ================${NC}"
+    local cur_cc
+    cur_cc=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)
+    echo -e "当前系统拥塞控制算法: ${GREEN}${cur_cc:-未知}${NC}"
+
+    if [[ "$cur_cc" == "bbr" ]]; then
+        echo -e "${YELLOW}BBR 加速当前处于【已启用】状态。${NC}"
+        read -rp "是否要关闭 BBR 并恢复为默认算法 (cubic)? [y/N]: " choice_bbr
+        if [[ "$choice_bbr" == "y" || "$choice_bbr" == "Y" ]]; then
+            sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf 2>/dev/null || true
+            sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf 2>/dev/null || true
+            echo "net.ipv4.tcp_congestion_control=cubic" >> /etc/sysctl.conf
+            sysctl -p >/dev/null 2>&1 || true
+            log_info "已关闭 BBR，当前拥塞控制算法已切换为: $(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)"
+        else
+            log_info "保持当前 BBR 状态不变。"
+        fi
+    else
+        echo -e "${YELLOW}BBR 加速当前处于【未启用】状态。${NC}"
+        read -rp "是否立即开启 Linux 原生 TCP BBR 加速? [y/N]: " choice_bbr
+        if [[ "$choice_bbr" == "y" || "$choice_bbr" == "Y" ]]; then
+            modprobe tcp_bbr 2>/dev/null || true
+            if ! grep -qw "bbr" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+                log_error "当前系统内核不支持 BBR（常见于 OpenVZ / LXC 架构容器或老旧内核版本）！"
+                sleep 2
+                return 1
+            fi
+            sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf 2>/dev/null || true
+            sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf 2>/dev/null || true
+            echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+            echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+            sysctl -p >/dev/null 2>&1 || true
+            local new_cc
+            new_cc=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)
+            if [[ "$new_cc" == "bbr" ]]; then
+                log_info "TCP BBR 加速已成功开启！当前算法: ${GREEN}bbr${NC}"
+            else
+                log_warn "BBR 参数已写入，但当前生效算法为: ${new_cc}，可能需要重启系统生效。"
+            fi
+        else
+            log_info "已取消开启 BBR。"
+        fi
+    fi
+    echo -e "\n按任意键返回..."
+    read -n 1 -s -r
+}
+
 # ── 修改配置子菜单 (单项直选修改，留空不改) ──────────────────────────────────
 config_menu() {
     local modified=0
     while true; do
         clear
-        local cur_uuid cur_pwd cur_port cur_name cur_domain cur_auth cur_cf cur_km_domain cur_km_token
+        local cur_uuid cur_pwd cur_port cur_name cur_domain cur_auth cur_cf cur_km_domain cur_km_token cur_bbr
         cur_uuid=$(get_env "UUID")
         [[ -z "$cur_uuid" ]] && cur_uuid="a982ac5f-9acd-4d38-9140-56f0b27c6961"
         cur_pwd=$(get_env "PASSWORD")
@@ -465,6 +526,8 @@ config_menu() {
         local cur_km="未配置"
         [[ -n "$cur_km_domain" && -n "$cur_km_token" ]] && cur_km="已配置 (${cur_km_domain})"
 
+        cur_bbr=$(get_bbr_status)
+
         echo -e "${CYAN}====================================================${NC}"
         echo -e "${WHITE}                  ⚙️  修改配置${NC}"
         echo -e "${CYAN}====================================================${NC}"
@@ -476,10 +539,11 @@ config_menu() {
         echo -e " ${GREEN}6.${NC} Argo 隧道凭证  : ${CYAN}${cur_auth}${NC}"
         echo -e " ${GREEN}7.${NC} CF 优选域名    : ${CYAN}${cur_cf}${NC}"
         echo -e " ${GREEN}8.${NC} Komari 探针    : ${CYAN}${cur_km}${NC}"
+        echo -e " ${GREEN}9.${NC} TCP BBR 加速   : ${CYAN}${cur_bbr}${NC}"
         echo -e "${CYAN}----------------------------------------------------${NC}"
         echo -e " ${WHITE}0.${NC} 返回主菜单"
         echo -e "${CYAN}====================================================${NC}"
-        read -rp "请输入要修改的配置项 [0-8]: " cfg_choice
+        read -rp "请输入要修改的配置项 [0-9]: " cfg_choice
 
         case "$cfg_choice" in
             1)
@@ -567,6 +631,9 @@ config_menu() {
                     modified=1
                 fi
                 ;;
+            9)
+                manage_bbr
+                ;;
             0)
                 if [[ "$modified" -eq 1 ]]; then
                     svc_restart >/dev/null 2>&1 || true
@@ -576,7 +643,7 @@ config_menu() {
                 break
                 ;;
             *)
-                log_error "无效选项，请输入 0-8 之间的数字！"
+                log_error "无效选项，请输入 0-9 之间的数字！"
                 sleep 1
                 ;;
         esac
@@ -906,6 +973,7 @@ show_help() {
     echo -e " ${GREEN}argo sub${NC}           - 查看节点连接链接与 Base64 订阅内容"
     echo -e " ${GREEN}argo log${NC}           - 实时查看服务运行日志 (按 Ctrl+C 退出)"
     echo -e " ${GREEN}argo edit${NC}          - 修改核心参数 (UUID/密码/端口/隧道Token/CF优选)"
+    echo -e " ${GREEN}argo bbr${NC}           - 管理开启或关闭系统 TCP BBR 拥塞控制加速"
     echo -e " ${GREEN}argo update${NC}        - 一键检查并拉取更新服务端到最新版"
     echo -e " ${RED}argo uninstall${NC}     - 彻底卸载 Argo 服务与所有配置文件"
     echo -e " ${GREEN}argo help${NC}          - 显示本命令行帮助目录"
@@ -947,6 +1015,9 @@ if [[ -n "$1" ]]; then
         log)     view_logs ;;
         edit|config)
             config_menu
+            ;;
+        bbr)
+            manage_bbr
             ;;
         update|upgrade)
             nat64_enable_temp
