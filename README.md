@@ -1,59 +1,6 @@
 # Argo
 
 > **Zero-Binary (零外部内核) 纯原生穿透代理系统**  
-> 彻底摆脱对 `sing-box` / `Xray` 等外部可执行二进制内核的依赖，100% 由原生代码实现协议握手与数据转发。基于 Cloudflare Argo 隧道，实现 0 入站端口暴露、免申请 TLS 证书、防封锁救砖，专为现代免费 PaaS 容器平台（Koyeb、Render、HuggingFace、Railway 等）与轻量 VPS 量身定制。
-
----
-
-## 🌟 核心特色
-
-1. **Zero-Binary 纯原生代理引擎（Node.js & Python 双版本）**
-   - **零二进制外挂**：没有下载和运行 `sing-box`、`xray` 等非系统级二进制文件，系统进程仅有原生的 `node` 或 `python`，彻底免疫平台对可执行代理二进制的扫描查杀。
-   - **秒级冷启动**：开机无需等待外部庞大内核下载解压，毫秒级瞬时就绪，彻底告别 GitHub API 限流（HTTP 403）和 libc 兼容问题。
-   - **极低内存占用**：Node.js 版运行时仅需 **~30MB** 内存，高并发 I/O 吞吐极佳，即使在 256MB/512MB 内存的极小容器中也能稳定常驻。
-
-2. **100% Argo 隧道集成（0 端口暴露）**
-   - 无需公网入站端口，无需繁琐的 ACME 证书申请与续期。
-   - 支持 **临时穿透隧道**（开箱即用，动态解析）与 **固定 Token 隧道**（稳定域名）。
-   - 固定隧道 Token 采用系统环境变量传递，不在 CLI 命令行暴露，避免 `ps aux` 敏感凭证泄露。
-
-3. **4 大原生高能协议矩阵**
-   - `VLESS + xhttp + Argo TLS`（最新 SplitHTTP 流式全双工传输，带 2KB 头部防探测保护）
-   - `VLESS + WS + Argo TLS`（经典通用高兼容 WebSocket）
-   - `Trojan + xhttp + Argo TLS`（Trojan 密码体系 + SplitHTTP 分块流）
-   - `Trojan + WS + Argo TLS`（经典密码体系高隐蔽 Trojan 流量）
-
-4. **双向保活守护与反查杀**
-   - 内置守护保活引擎，支持指数退避重启（3s ~ 60s），被平台意外杀死后自动拉起。
-   - Node.js 版内置进程名伪装（`node /app/bridge.js`）。
-
-5. **全自动订阅与多通道分发**
-   - 自动探测公网出口并标准化生成 `国家-运营商` 节点名称（如 `HK-Tencent`）。
-   - **多通道分发**：支持 `/sub` HTTP 订阅路径、控制台 Base64 输出、Telegram 实时推送。
-   - **隐私保护与自洁**：控制台初始日志与临时 `sub.txt` 配置文件定时自动清理自毁（默认 2 分钟），转入静默守护模式。
-
-6. **Komari 监控探针无缝集成**
-   - 原生支持 Komari 探针，集成容器在线时长虚拟化（解决容器平台宿主机运行几百天导致的探针统计异常问题）。
-
----
-
-## 📂 工程结构
-
-```text
-argo/
-├── nodejs/               # Node.js 纯原生端（极速轻量首选，内存仅 ~30MB）
-│   ├── index.js          # 原生协议引擎、隧道守护与订阅中心
-│   ├── index.html        # 高质量静态伪装页面（灯塔守望者日记）
-│   └── package.json
-├── python/               # Python 异步全双工纯原生端（asyncio + aiohttp）
-│   ├── app.py
-│   ├── index.html
-│   └── requirements.txt
-├── Dockerfile            # 官方推荐 Node.js 极速轻量镜像构建文件
-├── .dockerignore
-└── README.md
-```
-
 ---
 
 ## ⚙️ 环境变量配置
@@ -82,9 +29,9 @@ argo/
 
 ## 🚀 部署指南
 
-### 方式一：Linux VPS 一键管理脚本（最推荐）
+### 方式一：Linux VPS 一键管理脚本
 
-适用于任意 Ubuntu / Debian / CentOS / AlmaLinux / Rocky 等 Linux VPS 服务器，全自动配置环境与守护进程：
+适用于任意 Ubuntu / Debian / CentOS 等 Linux VPS 服务器，全自动配置环境与守护进程：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/zaofengyue/argo/main/argo.sh)
@@ -112,7 +59,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/zaofengyue/argo/main/argo.sh
 
 ### 方式二：Docker 运行
 
-#### 1. 临时隧道模式（无需任何域名和 Token，开箱即用）
+#### 1. 临时隧道模式
 ```bash
 docker run -d \
   --name argo \
@@ -125,7 +72,7 @@ docker run -d \
 > docker logs argo
 > ```
 
-#### 2. 固定隧道模式（绑定自己的 Cloudflare 域名）
+#### 2. 固定隧道模式
 ```bash
 docker run -d \
   --name argo \
@@ -170,30 +117,12 @@ docker compose up -d
 
 ---
 
-### 方式四：云端免费 PaaS 容器平台部署（Koyeb、Render、HuggingFace 等）
+### 方式四：云端免费 PaaS 容器平台部署
 
 1. **仓库构建**：将本项目推送到您的 GitHub 私有或公开仓库。
 2. **选择构建方式**：直接选择 **Dockerfile** 构建。
 3. **设置环境变量**：在平台的 Environment Variables 界面填入你需要的变量（如 `UUID`、`ARGO_AUTH`、`ARGO_DOMAIN`、`TG_BOT_TOKEN` 等）。
 4. **部署上线**：平台拉取代码完成构建后自动启动，无需映射公网端口（全部流量经由 Cloudflare Argo 安全传输）。
-
----
-
-### 方式五：本地 / 源码直接运行
-
-#### 运行 Node.js 版
-```bash
-cd nodejs
-npm install
-node index.js
-```
-
-#### 运行 Python 版
-```bash
-cd python
-pip install -r requirements.txt
-python app.py
-```
 
 ---
 
