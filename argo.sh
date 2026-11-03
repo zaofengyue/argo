@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Argo - Zero-Binary 纯原生代理服务端一键管理脚本
-# GitHub: https://github.com/zaofengyue/argo-nodejs
+# GitHub: https://github.com/zaofengyue/argo
 # ==============================================================================
 
 export LANG="en_US.UTF-8"
@@ -23,7 +23,7 @@ ENV_FILE="$APP_DIR/config.env"
 SVC_NAME="argo"
 SVC_FILE="/etc/systemd/system/${SVC_NAME}.service"
 BIN_LINK="/usr/local/bin/argo"
-REPO_RAW="https://raw.githubusercontent.com/zaofengyue/argo-nodejs/main"
+REPO_RAW="https://raw.githubusercontent.com/zaofengyue/argo/main"
 
 # ── 日志工具 ──────────────────────────────────────────────────────────────────
 log_info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
