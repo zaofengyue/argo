@@ -4,6 +4,21 @@
 # GitHub: https://github.com/zaofengyue/argo
 # ==============================================================================
 
+# Alpine ash 兼容性处理：若当前不是 bash 则尝试唤起或自动安装 bash
+if [ -z "${BASH_VERSION:-}" ]; then
+    if command -v bash >/dev/null 2>&1; then
+        exec bash "$0" "$@"
+    elif [ "$(id -u 2>/dev/null || echo 1)" = "0" ] && command -v apk >/dev/null 2>&1; then
+        echo "检测到 Alpine 系统，自动安装 bash 与基础工具..."
+        apk update >/dev/null 2>&1 || true
+        apk add --no-cache bash >/dev/null 2>&1 || true
+        exec bash "$0" "$@"
+    else
+        echo "本脚本需要 bash 才能运行，当前系统未检测到 bash。"
+        exit 1
+    fi
+fi
+
 export LANG="en_US.UTF-8"
 export LC_ALL="en_US.UTF-8"
 
@@ -21,7 +36,9 @@ NC='\033[0m'
 APP_DIR="/opt/argo"
 ENV_FILE="$APP_DIR/config.env"
 SVC_NAME="argo"
-SVC_FILE="/etc/systemd/system/${SVC_NAME}.service"
+SVC_SYSTEMD="/etc/systemd/system/${SVC_NAME}.service"
+SVC_OPENRC="/etc/init.d/${SVC_NAME}"
+OPENRC_LOG="/var/log/argo.log"
 BIN_LINK="/usr/local/bin/argo"
 REPO_RAW="https://raw.githubusercontent.com/zaofengyue/argo/main"
 
@@ -38,17 +55,129 @@ check_root() {
     fi
 }
 
-check_systemd() {
-    if ! command -v systemctl >/dev/null 2>&1; then
-        log_error "当前系统不支持 systemd，本脚本仅支持带 systemd 的 Linux 发行版 (Debian / Ubuntu / CentOS / AlmaLinux / Rocky 等)！"
+INIT_TYPE=""
+check_init_system() {
+    if command -v systemctl >/dev/null 2>&1; then
+        INIT_TYPE="systemd"
+    elif command -v rc-service >/dev/null 2>&1 || [ -f /etc/alpine-release ]; then
+        INIT_TYPE="openrc"
+    else
+        log_error "当前系统既不支持 systemd 也不支持 OpenRC，本脚本暂不支持当前环境！"
         exit 1
     fi
 }
 
+# ── 服务操作封装 (兼容 systemd 与 OpenRC) ──────────────────────────────────────
+svc_start() {
+    if [[ "$INIT_TYPE" == "systemd" ]]; then
+        systemctl start "$SVC_NAME"
+    elif [[ "$INIT_TYPE" == "openrc" ]]; then
+        rc-service "$SVC_NAME" start
+    fi
+}
+
+svc_stop() {
+    if [[ "$INIT_TYPE" == "systemd" ]]; then
+        systemctl stop "$SVC_NAME"
+    elif [[ "$INIT_TYPE" == "openrc" ]]; then
+        rc-service "$SVC_NAME" stop
+    fi
+}
+
+svc_restart() {
+    if [[ "$INIT_TYPE" == "systemd" ]]; then
+        systemctl restart "$SVC_NAME"
+    elif [[ "$INIT_TYPE" == "openrc" ]]; then
+        rc-service "$SVC_NAME" restart 2>/dev/null || { rc-service "$SVC_NAME" stop >/dev/null 2>&1; rc-service "$SVC_NAME" start; }
+    fi
+}
+
+svc_is_active() {
+    if [[ "$INIT_TYPE" == "systemd" ]]; then
+        systemctl is-active --quiet "$SVC_NAME"
+    elif [[ "$INIT_TYPE" == "openrc" ]]; then
+        rc-service "$SVC_NAME" status 2>/dev/null | grep -q "started"
+    else
+        return 1
+    fi
+}
+
+# ── 纯 IPv6 临时 NAT64/DNS64 辅助挂载 ──────────────────────────────────────────
+_NAT64_APPLIED=0
+_NAT64_TARGET_CONF=""
+_NAT64_ORIG_CONTENT=""
+
+nat64_recover_leftover() {
+    [ -f /etc/resolv.conf.sb-orig ] || return 0
+    local _rc="/etc/resolv.conf"
+    [ -L "$_rc" ] && _rc="$(readlink -f "$_rc" 2>/dev/null || echo "/etc/resolv.conf")"
+    if [ -w "$_rc" ] && grep -q "2a01:4f8:c2c:123f::1" "$_rc" 2>/dev/null; then
+        cat /etc/resolv.conf.sb-orig > "$_rc" 2>/dev/null || true
+    fi
+    rm -f /etc/resolv.conf.sb-orig 2>/dev/null || true
+}
+
+nat64_enable_temp() {
+    local _probed="${1:-0}"
+    [ "$(id -u 2>/dev/null || echo 1)" = "0" ] || return 0
+    nat64_recover_leftover
+    local _has_v4=0
+    if command -v ip >/dev/null 2>&1; then
+        ip -4 route show default 2>/dev/null | grep -q default && _has_v4=1
+    elif command -v route >/dev/null 2>&1; then
+        route -n 2>/dev/null | grep -q '^0.0.0.0' && _has_v4=1
+    fi
+    [ "$_has_v4" = "1" ] && return 0
+
+    if [ "$_probed" != "1" ] && command -v curl >/dev/null 2>&1; then
+        curl -s --connect-timeout 2 -m 3 https://api.github.com >/dev/null 2>&1 && return 0
+    fi
+
+    local _rc="/etc/resolv.conf"
+    [ -e "$_rc" ] || return 0
+    if [ -L "$_rc" ]; then
+        _rc="$(readlink -f "$_rc" 2>/dev/null || echo "/etc/resolv.conf")"
+    fi
+    [ -w "$_rc" ] || return 0
+
+    local _n1="2a01:4f8:c2c:123f::1" _n2="2001:67c:2b0::4"
+    if ! grep -q "$_n1" "$_rc" 2>/dev/null && ! grep -q "$_n2" "$_rc" 2>/dev/null; then
+        cp -f "$_rc" /etc/resolv.conf.sb-orig 2>/dev/null || return 0
+        trap 'nat64_restore_temp' EXIT
+        trap 'nat64_restore_temp; exit 130' INT
+        trap 'nat64_restore_temp; exit 143' TERM
+        trap 'nat64_restore_temp; exit 129' HUP
+        _NAT64_TARGET_CONF="$_rc"
+        _NAT64_ORIG_CONTENT="$(cat "$_rc" 2>/dev/null)"
+        log_info "检测到纯 IPv6 环境无法直连 GitHub，正在临时挂载公共 NAT64/DNS64 辅助网络通信..."
+        printf 'nameserver %s\nnameserver %s\n%s\n' "$_n1" "$_n2" "$_NAT64_ORIG_CONTENT" > "$_rc" 2>/dev/null || true
+        _NAT64_APPLIED=1
+    fi
+}
+
+nat64_restore_temp() {
+    if [ "$_NAT64_APPLIED" = "1" ] && [ -n "$_NAT64_TARGET_CONF" ] && [ -w "$_NAT64_TARGET_CONF" ]; then
+        if [ -f /etc/resolv.conf.sb-orig ]; then
+            cat /etc/resolv.conf.sb-orig > "$_NAT64_TARGET_CONF" 2>/dev/null || true
+        elif [ -n "$_NAT64_ORIG_CONTENT" ]; then
+            printf '%s\n' "$_NAT64_ORIG_CONTENT" > "$_NAT64_TARGET_CONF" 2>/dev/null || true
+        fi
+        rm -f /etc/resolv.conf.sb-orig 2>/dev/null || true
+        trap - EXIT INT TERM HUP
+    fi
+    _NAT64_APPLIED=0
+    _NAT64_TARGET_CONF=""
+    _NAT64_ORIG_CONTENT=""
+}
+
 # ── 包管理器探测与依赖安装 ───────────────────────────────────────────────────
 install_dependencies() {
+    nat64_enable_temp
     log_info "正在检测并安装基础依赖 (curl, tar, git, ca-certificates)..."
-    if command -v apt-get >/dev/null 2>&1; then
+    if command -v apk >/dev/null 2>&1; then
+        apk update
+        apk add --no-cache curl tar git ca-certificates openssl procps bash nodejs npm
+    elif command -v apt-get >/dev/null 2>&1; then
         apt-get update -y
         apt-get install -y curl tar git ca-certificates openssl procps
     elif command -v yum >/dev/null 2>&1; then
@@ -62,6 +191,7 @@ install_dependencies() {
 
 # ── Node.js 运行时探测与自动安装 ─────────────────────────────────────────────
 ensure_nodejs() {
+    nat64_enable_temp
     local need_install=0
     if command -v node >/dev/null 2>&1; then
         local ver
@@ -79,7 +209,9 @@ ensure_nodejs() {
 
     if [[ "$need_install" -eq 1 ]]; then
         log_info "正在自动安装 Node.js LTS 官方运行库..."
-        if command -v apt-get >/dev/null 2>&1; then
+        if command -v apk >/dev/null 2>&1; then
+            apk add --no-cache nodejs npm
+        elif command -v apt-get >/dev/null 2>&1; then
             curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
             apt-get install -y nodejs
         elif command -v dnf >/dev/null 2>&1; then
@@ -91,7 +223,7 @@ ensure_nodejs() {
         fi
 
         if ! command -v node >/dev/null 2>&1; then
-            log_error "Node.js 自动安装失败，请手动安装 Node.js 20 后重新运行脚本！"
+            log_error "Node.js 自动安装失败，请手动安装 Node.js 18+ 后重新运行脚本！"
             exit 1
         fi
         log_info "Node.js 安装成功: $(node -v)"
@@ -303,7 +435,7 @@ config_menu() {
                 ;;
             0)
                 if [[ "$modified" -eq 1 ]]; then
-                    systemctl restart "$SVC_NAME" >/dev/null 2>&1 || true
+                    svc_restart >/dev/null 2>&1 || true
                     log_info "配置已修改，Argo 服务已自动重启生效！"
                     sleep 1.5
                 fi
@@ -319,6 +451,7 @@ config_menu() {
 
 # ── 安装 / 更新核心代码 ───────────────────────────────────────────────────────
 deploy_core() {
+    nat64_enable_temp
     log_info "正在配置 Argo 核心目录: ${APP_DIR}..."
     mkdir -p "$APP_DIR/nodejs"
 
@@ -340,13 +473,14 @@ deploy_core() {
     chmod +x "/usr/local/bin/ag" 2>/dev/null || true
 }
 
-# ── 注册 Systemd 守护服务 ─────────────────────────────────────────────────────
+# ── 注册系统守护服务 (支持 Systemd 与 OpenRC) ─────────────────────────────────
 install_service() {
-    log_info "正在注册 systemd 系统守护服务 (${SVC_NAME})..."
     local node_bin
     node_bin=$(command -v node)
 
-    cat > "$SVC_FILE" <<EOF
+    if [[ "$INIT_TYPE" == "systemd" ]]; then
+        log_info "正在注册 systemd 系统守护服务 (${SVC_NAME})..."
+        cat > "$SVC_SYSTEMD" <<EOF
 [Unit]
 Description=Argo Zero-Binary Proxy Service
 After=network.target
@@ -365,15 +499,50 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    systemctl enable "$SVC_NAME" >/dev/null 2>&1
-    systemctl restart "$SVC_NAME"
-    log_info "Argo 服务已启动并设置开机自启！"
+        systemctl daemon-reload
+        systemctl enable "$SVC_NAME" >/dev/null 2>&1
+        systemctl restart "$SVC_NAME"
+        log_info "Argo 服务已启动并设置开机自启！"
+    elif [[ "$INIT_TYPE" == "openrc" ]]; then
+        log_info "正在注册 OpenRC 系统守护服务 (${SVC_NAME})..."
+        cat > "$SVC_OPENRC" <<EOF
+#!/sbin/openrc-run
+
+name="argo"
+description="Argo Zero-Binary Proxy Service"
+directory="${APP_DIR}/nodejs"
+pidfile="/run/argo.pid"
+command="${node_bin}"
+command_args="index.js"
+command_background="yes"
+output_log="${OPENRC_LOG}"
+error_log="${OPENRC_LOG}"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    checkpath -d -m 0755 /run
+    if [ -f "${ENV_FILE}" ]; then
+        set -a
+        . "${ENV_FILE}"
+        set +a
+    fi
+}
+EOF
+        chmod +x "$SVC_OPENRC"
+        rc-update add "$SVC_NAME" default >/dev/null 2>&1
+        rc-service "$SVC_NAME" stop >/dev/null 2>&1 || true
+        rc-service "$SVC_NAME" start
+        log_info "Argo 服务已通过 OpenRC 启动并设置开机自启！"
+    fi
 }
 
 # ── 运行状态查询 ──────────────────────────────────────────────────────────────
 check_status() {
-    if systemctl is-active --quiet "$SVC_NAME"; then
+    if svc_is_active; then
         echo -e "Argo 运行状态: ${GREEN}● 正在运行 (Active)${NC}"
         local pid
         pid=$(pgrep -f "node index.js" | head -1)
@@ -403,8 +572,13 @@ show_subscription() {
     fi
 
     # 从日志中提取最新域名与信息
-    local domain
-    domain=$(journalctl -u "$SVC_NAME" --no-pager -n 50 2>/dev/null | grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' | tail -1)
+    local domain=""
+    if [[ "$INIT_TYPE" == "systemd" ]]; then
+        domain=$(journalctl -u "$SVC_NAME" --no-pager -n 50 2>/dev/null | grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' | tail -1)
+    else
+        domain=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$OPENRC_LOG" 2>/dev/null | tail -1)
+    fi
+
     if [[ -z "$domain" ]]; then
         domain=$(get_env "ARGO_DOMAIN")
         [[ -n "$domain" ]] && domain="https://${domain}"
@@ -422,6 +596,17 @@ show_subscription() {
     echo -e "${CYAN}========================================================${NC}\n"
 }
 
+# ── 实时日志查看 ──────────────────────────────────────────────────────────────
+view_logs() {
+    echo -e "${YELLOW}按 Ctrl+C 退出实时日志查看...${NC}\n"
+    if [[ "$INIT_TYPE" == "systemd" ]]; then
+        journalctl -u "$SVC_NAME" -f -n 50
+    else
+        touch "$OPENRC_LOG"
+        tail -f -n 50 "$OPENRC_LOG"
+    fi
+}
+
 # ── 卸载清理 ──────────────────────────────────────────────────────────────────
 uninstall_argo() {
     echo -e "${RED}确定要彻底卸载 Argo 服务吗? 相关的配置和数据都将被删除！${NC}"
@@ -432,10 +617,18 @@ uninstall_argo() {
     fi
 
     log_info "正在停止并清理 Argo 服务..."
-    systemctl stop "$SVC_NAME" >/dev/null 2>&1
-    systemctl disable "$SVC_NAME" >/dev/null 2>&1
-    rm -f "$SVC_FILE"
-    systemctl daemon-reload
+    if [[ "$INIT_TYPE" == "systemd" ]]; then
+        systemctl stop "$SVC_NAME" >/dev/null 2>&1
+        systemctl disable "$SVC_NAME" >/dev/null 2>&1
+        rm -f "$SVC_SYSTEMD"
+        systemctl daemon-reload
+    elif [[ "$INIT_TYPE" == "openrc" ]]; then
+        rc-service "$SVC_NAME" stop >/dev/null 2>&1 || true
+        rc-update del "$SVC_NAME" default >/dev/null 2>&1 || true
+        rm -f "$SVC_OPENRC"
+        rm -f /run/argo.pid
+        rm -f "$OPENRC_LOG"
+    fi
 
     pkill -f "bridge" 2>/dev/null || true
     pkill -f "metrics" 2>/dev/null || true
@@ -446,6 +639,10 @@ uninstall_argo() {
     rm -f "$BIN_LINK"
     rm -f "/usr/local/bin/ag" 2>/dev/null || true
     rm -rf "$HOME/.argo-core"
+
+    # 若残留 NAT64 注入，一并清理复原
+    nat64_restore_temp
+    nat64_recover_leftover
 
     log_info "Argo 服务及所有配置文件已彻底清除！"
 }
@@ -477,7 +674,7 @@ main_menu() {
     case "$choice" in
         1)
             check_root
-            check_systemd
+            check_init_system
             install_dependencies
             ensure_nodejs
             quick_install_wizard
@@ -492,25 +689,24 @@ main_menu() {
             ;;
         3)
             check_root
-            systemctl start "$SVC_NAME"
+            svc_start
             log_info "服务已启动。"
             ;;
         4)
             check_root
-            systemctl stop "$SVC_NAME"
+            svc_stop
             log_info "服务已停止。"
             ;;
         5)
             check_root
-            systemctl restart "$SVC_NAME"
+            svc_restart
             log_info "服务已重启。"
             ;;
         6)
             show_subscription
             ;;
         7)
-            echo -e "${YELLOW}按 Ctrl+C 退出实时日志查看...${NC}\n"
-            journalctl -u "$SVC_NAME" -f -n 50
+            view_logs
             ;;
         8)
             check_root
@@ -518,13 +714,14 @@ main_menu() {
             ;;
         9)
             check_root
+            nat64_enable_temp
             log_info "正在从 GitHub 拉取最新脚本与服务端核心..."
             curl -fsSL -H "Cache-Control: no-cache" "${REPO_RAW}/argo.sh" -o "$APP_DIR/argo.sh" 2>/dev/null || true
             chmod +x "$APP_DIR/argo.sh"
             ln -sf "$APP_DIR/argo.sh" "$BIN_LINK" 2>/dev/null || true
             ln -sf "$APP_DIR/argo.sh" "/usr/local/bin/ag" 2>/dev/null || true
             deploy_core
-            systemctl restart "$SVC_NAME" >/dev/null 2>&1 || true
+            svc_restart >/dev/null 2>&1 || true
             log_info "Argo 脚本与核心已成功更新至最新版本！"
             echo -e "\n按任意键重新载入最新菜单..."
             read -n 1 -s -r
@@ -560,9 +757,11 @@ show_help() {
 
 # ── 脚本入口 ──────────────────────────────────────────────────────────────────
 check_root
+check_init_system
 
 # 预置实体脚本与全局快捷命令 (确保无论是否已安装，argo 与 ag 均立即可用)
 init_shortcut() {
+    nat64_enable_temp
     mkdir -p "$APP_DIR"
     if [[ ! -s "$APP_DIR/argo.sh" || "$0" == /dev/fd/* || "$0" == /proc/* ]]; then
         curl -fsSL -H "Cache-Control: no-cache" "${REPO_RAW}/argo.sh" -o "$APP_DIR/argo.sh" 2>/dev/null || true
@@ -580,7 +779,7 @@ init_shortcut
 if [[ -n "$1" ]]; then
     case "$1" in
         install)
-            check_systemd
+            check_init_system
             install_dependencies
             ensure_nodejs
             quick_install_wizard
@@ -590,23 +789,24 @@ if [[ -n "$1" ]]; then
             show_subscription
             ;;
         menu)    main_menu ;;
-        start)   systemctl start "$SVC_NAME"; log_info "服务已启动。" ;;
-        stop)    systemctl stop "$SVC_NAME"; log_info "服务已停止。" ;;
-        restart) systemctl restart "$SVC_NAME"; log_info "服务已重启。" ;;
+        start)   svc_start; log_info "服务已启动。" ;;
+        stop)    svc_stop; log_info "服务已停止。" ;;
+        restart) svc_restart; log_info "服务已重启。" ;;
         status)  check_status ;;
         sub)     show_subscription ;;
-        log)     journalctl -u "$SVC_NAME" -f -n 50 ;;
+        log)     view_logs ;;
         edit|config)
             config_menu
             ;;
         update|upgrade)
+            nat64_enable_temp
             log_info "正在拉取最新代码更新..."
             curl -fsSL -H "Cache-Control: no-cache" "${REPO_RAW}/argo.sh" -o "$APP_DIR/argo.sh" 2>/dev/null || true
             chmod +x "$APP_DIR/argo.sh"
             ln -sf "$APP_DIR/argo.sh" "$BIN_LINK" 2>/dev/null || true
             ln -sf "$APP_DIR/argo.sh" "/usr/local/bin/ag" 2>/dev/null || true
             deploy_core
-            systemctl restart "$SVC_NAME" >/dev/null 2>&1 || true
+            svc_restart >/dev/null 2>&1 || true
             log_info "Argo 已更新至最新版本并重启！"
             ;;
         uninstall) uninstall_argo ;;
