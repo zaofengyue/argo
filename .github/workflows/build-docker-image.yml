@@ -5,8 +5,8 @@ on:
     branches: [ main ]
     paths:
       - 'Dockerfile'
-      - 'index.js'
-      - 'package.json'
+      - 'nodejs/**'
+      - '.github/workflows/**'
   pull_request:
     branches: [ main ]
   workflow_dispatch:
@@ -39,10 +39,11 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: |
+            ghcr.io/${{ github.repository_owner }}/argo:latest
             ghcr.io/${{ github.repository_owner }}/node:2025
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.description=HTTP Server
+            org.opencontainers.image.description=Argo Zero-Binary Proxy Server
             org.opencontainers.image.licenses=MIT
           cache-from: type=gha
           cache-to: type=gha,mode=max

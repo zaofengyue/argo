@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Thoughtfully brewed coffee and freshly baked treats, made for your everyday moments.">
+  <title>The Daily Grind</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: Arial, Helvetica, sans-serif; color: #f5f5f5; background: #101827; line-height: 1.6; }
+    header { min-height: 72vh; display: grid; place-items: center; text-align: center; padding: 72px 22px; background: linear-gradient(135deg, #142d3d, #253b52 55%, #5b4b45); }
+    .hero { max-width: 850px; }
+    .eyebrow { text-transform: uppercase; letter-spacing: .22em; font-size: .78rem; color: #b9d8d2; }
+    h1 { font-size: clamp(2.5rem, 8vw, 5.6rem); line-height: 1.05; margin: 18px 0; }
+    header p { color: #e1e8eb; font-size: 1.15rem; max-width: 650px; margin: 0 auto; }
+    .button { display: inline-block; margin-top: 28px; padding: 12px 24px; border-radius: 999px; background: #d9a86c; color: #17212b; text-decoration: none; font-weight: 700; }
+    nav { display: flex; justify-content: center; flex-wrap: wrap; gap: 24px; padding: 17px; background: #0b1220; }
+    nav a { color: #e9e9e9; text-decoration: none; font-size: .95rem; }
+    nav a:hover { color: #d9a86c; }
+    main { max-width: 1080px; margin: auto; padding: 65px 22px; }
+    h2 { text-align: center; font-size: 2rem; margin: 0 0 12px; }
+    .intro { text-align: center; color: #b9c4ce; margin: 0 auto 35px; max-width: 650px; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; }
+    .card { background: #1b2939; padding: 26px; border: 1px solid #344456; border-radius: 14px; }
+    .number { color: #d9a86c; font-size: .8rem; letter-spacing: .15em; }
+    h3 { margin: 12px 0 8px; }
+    .card p, li { color: #c5ced7; }
+    .features { max-width: 620px; margin: 26px auto 0; padding-left: 24px; }
+    footer { text-align: center; padding: 28px 20px; background: #0b1220; color: #aeb8c3; font-size: .9rem; }
+    @media (max-width: 600px) { nav { gap: 14px; } main { padding-top: 48px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="hero">
+      <div class="eyebrow">The Daily Grind</div>
+      <h1>GOOD COFFEE. SLOW MORNINGS.</h1>
+      <p>Thoughtfully brewed coffee and freshly baked treats, made for your everyday moments.</p>
+      <a class="button" href="#discover">Discover More</a>
+    </div>
+  </header>
+  <nav aria-label="Main navigation">
+    <a href="#discover">Discover</a>
+    <a href="#highlights">Highlights</a>
+    <a href="#about">About</a>
+  </nav>
+  <main>
+    <section id="discover">
+      <h2>Explore the Experience</h2>
+      <p class="intro">Every great journey starts with curiosity. Take a look at what makes this world worth exploring.</p>
+      <div class="cards">
+        <article class="card"><span class="number">01</span><h3>Our Coffee</h3><p>Explore carefully selected beans, balanced espresso, and smooth pour-over coffee.</p></article>
+<article class="card"><span class="number">02</span><h3>Fresh from the Oven</h3><p>Pair your favorite drink with pastries and seasonal bakery treats.</p></article>
+<article class="card"><span class="number">03</span><h3>A Place to Pause</h3><p>Settle in, catch up with friends, or enjoy a quiet moment to yourself.</p></article>
+      </div>
+    </section>
+    <section id="highlights" style="padding-top:70px">
+      <h2>Our Highlights</h2>
+      <p class="intro">A few ideas to inspire your next step.</p>
+      <ul class="features"><li>Espresso & cappuccino</li>
+<li>Single-origin pour-over</li>
+<li>Fresh pastries every morning</li></ul>
+    </section>
+    <section id="about" style="padding-top:55px; text-align:center">
+      <h2>Be Part of the Story</h2>
+      <p class="intro">Stay curious, explore something new, and share the experience with others.</p>
+    </section>
+  </main>
+  <footer>© 2026 The Daily Grind. All rights reserved.</footer>
+</body>
+</html>

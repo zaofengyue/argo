@@ -1,0 +1,255 @@
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GameZone - Gaming Community</title>
+
+<style>
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: Arial, sans-serif;
+    background: #0b0715;
+    color: white;
+}
+
+/* Navigation */
+nav {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 22px 8%;
+    background: #100a20;
+}
+
+.logo {
+    color: #c084fc;
+    font-size: 28px;
+    font-weight: bold;
+}
+
+nav a {
+    color: white;
+    text-decoration: none;
+    margin-left: 25px;
+}
+
+nav a:hover {
+    color: #c084fc;
+}
+
+/* Hero */
+.hero {
+    min-height: 550px;
+    display: flex;
+    align-items: center;
+    padding: 60px 10%;
+    background: linear-gradient(
+        90deg,
+        rgba(11,7,21,0.95),
+        rgba(11,7,21,0.3)
+    ),
+    url("https://images.unsplash.com/photo-1542751371-adc38448a05e?w=1600");
+    background-size: cover;
+    background-position: center;
+}
+
+.hero-content {
+    max-width: 600px;
+}
+
+.hero h1 {
+    font-size: 58px;
+    color: #d8b4fe;
+    margin-bottom: 20px;
+}
+
+.hero p {
+    color: #ddd;
+    font-size: 18px;
+    line-height: 1.8;
+}
+
+.btn {
+    display: inline-block;
+    margin-top: 25px;
+    padding: 13px 30px;
+    background: #9333ea;
+    color: white;
+    text-decoration: none;
+    border-radius: 5px;
+}
+
+.btn:hover {
+    background: #a855f7;
+}
+
+/* Games */
+.games {
+    padding: 70px 8%;
+}
+
+.title {
+    text-align: center;
+    font-size: 36px;
+    color: #c084fc;
+    margin-bottom: 40px;
+}
+
+.game-container {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+    gap: 25px;
+}
+
+.game-card {
+    background: #1b1230;
+    border-radius: 12px;
+    overflow: hidden;
+    transition: 0.3s;
+}
+
+.game-card:hover {
+    transform: translateY(-8px);
+    box-shadow: 0 0 20px rgba(168,85,247,0.3);
+}
+
+.game-card img {
+    width: 100%;
+    height: 180px;
+    object-fit: cover;
+}
+
+.game-card h3 {
+    padding: 15px 15px 5px;
+    color: #d8b4fe;
+}
+
+.game-card p {
+    padding: 5px 15px 20px;
+    color: #bbb;
+    line-height: 1.6;
+}
+
+/* Community */
+.community {
+    text-align: center;
+    padding: 75px 20px;
+    background: linear-gradient(135deg, #32105c, #130b25);
+}
+
+.community h2 {
+    font-size: 35px;
+    margin-bottom: 20px;
+}
+
+.community p {
+    max-width: 650px;
+    margin: auto;
+    line-height: 1.8;
+    color: #ddd;
+}
+
+/* Footer */
+footer {
+    text-align: center;
+    padding: 25px;
+    background: #080510;
+    color: #999;
+}
+
+@media (max-width: 600px) {
+    nav {
+        flex-direction: column;
+        gap: 15px;
+    }
+
+    nav a {
+        margin: 0 8px;
+    }
+
+    .hero h1 {
+        font-size: 40px;
+    }
+}
+</style>
+</head>
+
+<body>
+
+<!-- Navigation -->
+<nav>
+    <div class="logo">GAMEZONE</div>
+    <div>
+        <a href="#home">Home</a>
+        <a href="#games">Games</a>
+        <a href="#community">Community</a>
+    </div>
+</nav>
+
+<!-- Hero Section -->
+<header class="hero" id="home">
+    <div class="hero-content">
+        <h1>ENTER THE GAME WORLD</h1>
+        <p>
+            Discover amazing games, meet new players,
+            and experience the excitement of gaming.
+            Your adventure starts here!
+        </p>
+        <a href="#games" class="btn">Explore Games</a>
+    </div>
+</header>
+
+<!-- Popular Games -->
+<section class="games" id="games">
+    <h2 class="title">POPULAR GAMES</h2>
+
+    <div class="game-container">
+
+        <div class="game-card">
+            <img src="https://images.unsplash.com/photo-1542751371-adc38448a05e?w=600" alt="Esports gaming">
+            <h3>Esports Arena</h3>
+            <p>Experience competitive gaming and exciting battles.</p>
+        </div>
+
+        <div class="game-card">
+            <img src="https://images.unsplash.com/photo-1511512578047-dfb367046420?w=600" alt="Gaming setup">
+            <h3>Adventure World</h3>
+            <p>Explore mysterious worlds and discover new adventures.</p>
+        </div>
+
+        <div class="game-card">
+            <img src="https://images.unsplash.com/photo-1493711662062-fa541adb3fc8?w=600" alt="Video game controller">
+            <h3>Action Games</h3>
+            <p>Challenge yourself with exciting action experiences.</p>
+        </div>
+
+    </div>
+</section>
+
+<!-- Community -->
+<section class="community" id="community">
+    <h2>JOIN OUR COMMUNITY</h2>
+    <p>
+        Gaming is more than just playing.
+        It is about friendship, teamwork, and unforgettable memories.
+        Connect with players around the world and share your passion!
+    </p>
+    <a href="#home" class="btn">Join the Adventure</a>
+</section>
+
+<!-- Footer -->
+<footer>
+    <p>© 2026 GAMEZONE. ALL RIGHTS RESERVED.</p>
+    <p>PLAY TOGETHER. WIN TOGETHER.</p>
+</footer>
+
+</body>
+</html>
+```

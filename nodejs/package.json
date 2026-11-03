@@ -1,0 +1,22 @@
+{
+  "name": "argo",
+  "version": "1.0.0",
+  "description": "Argo - Zero-Binary ultra-lightweight proxy engine without sing-box dependency",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "keywords": [
+    "proxy",
+    "vless",
+    "trojan",
+    "argo",
+    "cloudflare",
+    "zero-binary"
+  ],
+  "author": "",
+  "license": "MIT"
+}
