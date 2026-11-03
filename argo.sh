@@ -134,7 +134,7 @@ quick_install_wizard() {
             def_uuid="a982ac5f-9acd-4d38-9140-56f0b27c6961"
         fi
     fi
-    echo -e "${WHITE}1. 核心 UUID${NC} (回车默认: ${GREEN}${def_uuid}${NC})"
+    echo -e "${WHITE}1. 核心 UUID${NC} (回车默认: ${GREEN}自动生成${NC})"
     read -rp "   请输入 UUID: " input_uuid
     local final_uuid="${input_uuid:-$def_uuid}"
     set_env "UUID" "$final_uuid"
@@ -143,7 +143,7 @@ quick_install_wizard() {
     local def_pwd
     def_pwd=$(get_env "PASSWORD")
     [[ -z "$def_pwd" ]] && def_pwd="$final_uuid"
-    echo -e "\n${WHITE}2. Trojan 密码${NC} (回车默认复用 UUID: ${GREEN}${final_uuid}${NC})"
+    echo -e "\n${WHITE}2. Trojan 密码${NC} (回车默认: ${GREEN}复用UUID${NC})"
     read -rp "   请输入密码: " input_pwd
     set_env "PASSWORD" "${input_pwd:-$def_pwd}"
 
@@ -158,8 +158,8 @@ quick_install_wizard() {
     # 4. 节点名称
     local def_name
     def_name=$(get_env "NAME")
-    echo -e "\n${WHITE}4. 节点标识名称${NC} (回车默认: ${GREEN}自动探测 国家-运营商${NC})"
-    read -rp "   请输入节点名称 (留空自动探测): " input_name
+    echo -e "\n${WHITE}4. 节点标识名称${NC} (回车默认: ${GREEN}自动探测${NC})"
+    read -rp "   请输入节点名称: " input_name
     set_env "NAME" "${input_name:-$def_name}"
 
     # 5/6/7/8 自动预设默认值，初次安装不在界面打扰，高级配置可进菜单修改
