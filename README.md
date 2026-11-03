@@ -89,7 +89,7 @@ docker run -d \
   --name argo \
   --restart unless-stopped \
   -e UUID="a982ac5f-9acd-4d38-9140-56f0b27c6961" \
-  your-image-name
+  ghcr.io/zaofengyue/argo:latest
 ```
 > 容器启动后，查看日志即可获取生成的 `trycloudflare.com` 穿透域名和 Base64 订阅：
 > ```bash
@@ -105,7 +105,7 @@ docker run -d \
   -e ARGO_AUTH="eyJhIjoi..." \
   -e TG_BOT_TOKEN="123456:ABC-DEF..." \
   -e TG_CHAT_ID="12345678" \
-  your-image-name
+  ghcr.io/zaofengyue/argo:latest
 ```
 
 ---
@@ -119,7 +119,7 @@ version: '3.8'
 
 services:
   argo:
-    image: your-image-name
+    image: ghcr.io/zaofengyue/argo:latest
     container_name: argo
     restart: unless-stopped
     environment:
