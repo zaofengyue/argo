@@ -232,11 +232,12 @@ deploy_core() {
     cd "$APP_DIR/nodejs" || exit 1
     npm install --omit=dev --silent
 
-    # 复制本脚本为全局管理快捷命令
+    # 复制本脚本为全局管理快捷命令 (支持 argo 与短命令 ag)
     cp -f "$0" "$APP_DIR/argo.sh" 2>/dev/null || true
     chmod +x "$APP_DIR/argo.sh"
     ln -sf "$APP_DIR/argo.sh" "$BIN_LINK"
     chmod +x "$BIN_LINK"
+    ln -sf "$APP_DIR/argo.sh" "/usr/local/bin/ag" 2>/dev/null || true
 }
 
 # ── 注册 Systemd 守护服务 ─────────────────────────────────────────────────────
@@ -343,6 +344,7 @@ uninstall_argo() {
 
     rm -rf "$APP_DIR"
     rm -f "$BIN_LINK"
+    rm -f "/usr/local/bin/ag" 2>/dev/null || true
     rm -rf "$HOME/.argo-core"
 
     log_info "Argo 服务及所有配置文件已彻底清除！"
@@ -430,6 +432,25 @@ main_menu() {
     esac
 }
 
+# ── 命令行帮助目录 ────────────────────────────────────────────────────────────
+show_help() {
+    echo -e "${CYAN}====================================================${NC}"
+    echo -e "${WHITE}      Argo - Zero-Binary 命令行常用指令目录${NC}"
+    echo -e "${CYAN}====================================================${NC}"
+    echo -e " ${GREEN}argo${NC} (或 ${GREEN}ag${NC})          - 呼出交互式管理主菜单 (默认)"
+    echo -e " ${GREEN}argo start${NC}         - 启动 Argo 代理服务"
+    echo -e " ${GREEN}argo stop${NC}          - 停止 Argo 代理服务"
+    echo -e " ${GREEN}argo restart${NC}       - 重启 Argo 代理服务"
+    echo -e " ${GREEN}argo status${NC}        - 查看服务运行状态、PID 与内存占用"
+    echo -e " ${GREEN}argo sub${NC}           - 查看节点连接链接与 Base64 订阅内容"
+    echo -e " ${GREEN}argo log${NC}           - 实时查看服务运行日志 (按 Ctrl+C 退出)"
+    echo -e " ${GREEN}argo edit${NC}          - 修改核心参数 (UUID/密码/端口/隧道Token/TG推送)"
+    echo -e " ${GREEN}argo update${NC}        - 一键检查并拉取更新服务端到最新版"
+    echo -e " ${RED}argo uninstall${NC}     - 彻底卸载 Argo 服务与所有配置文件"
+    echo -e " ${GREEN}argo help${NC}          - 显示本命令行帮助目录"
+    echo -e "${CYAN}====================================================${NC}"
+}
+
 # ── 脚本入口 ──────────────────────────────────────────────────────────────────
 check_root
 
@@ -442,15 +463,32 @@ if [[ -n "$1" ]]; then
             configure_service
             deploy_core
             install_service
+            sleep 3
+            show_subscription
             ;;
-        start)   systemctl start "$SVC_NAME" ;;
-        stop)    systemctl stop "$SVC_NAME" ;;
-        restart) systemctl restart "$SVC_NAME" ;;
+        menu)    main_menu ;;
+        start)   systemctl start "$SVC_NAME"; log_info "服务已启动。" ;;
+        stop)    systemctl stop "$SVC_NAME"; log_info "服务已停止。" ;;
+        restart) systemctl restart "$SVC_NAME"; log_info "服务已重启。" ;;
         status)  check_status ;;
         sub)     show_subscription ;;
         log)     journalctl -u "$SVC_NAME" -f -n 50 ;;
+        edit|config)
+            configure_service
+            systemctl restart "$SVC_NAME"
+            log_info "配置已重新载入并重启生效！"
+            ;;
+        update|upgrade)
+            log_info "正在拉取最新代码更新..."
+            deploy_core
+            systemctl restart "$SVC_NAME"
+            log_info "Argo 已更新至最新版本并重启！"
+            ;;
         uninstall) uninstall_argo ;;
-        *) echo "用法: argo [install|start|stop|restart|status|sub|log|uninstall]" ;;
+        help|-h|--help) show_help ;;
+        *)
+            show_help
+            ;;
     esac
 else
     while true; do

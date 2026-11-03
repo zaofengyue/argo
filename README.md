@@ -92,7 +92,21 @@ bash <(curl -fsSL https://raw.githubusercontent.com/zaofengyue/argo/main/argo.sh
 
 - **全中文交互面板**：支持一键安装、修改 UUID / 密码 / 端口 / Argo 穿透模式（临时或固定）、配置 TG 推送与探针；
 - **后台守护保活**：自动注册 `systemd` 服务，开机自启，故障自动拉起；
-- **系统快捷指令**：安装后在终端输入 `argo` 即可随时呼出管理菜单、查看 Base64 订阅、实时监控日志、一键更新与卸载。
+- **系统快捷指令**：安装后在 VPS 终端随时输入 `argo`（或短别名 `ag`）即可使用以下快捷命令：
+
+| 快捷命令 | 功能说明 |
+| :--- | :--- |
+| `argo` 或 `ag` | 打开全中文交互式管理面板（默认） |
+| `argo start` | 启动 Argo 代理服务 |
+| `argo stop` | 停止 Argo 代理服务 |
+| `argo restart` | 重启 Argo 代理服务 |
+| `argo status` | 查看运行状态、主进程 PID 与内存占用 |
+| `argo sub` | 查看节点连接链接与 Base64 订阅内容 |
+| `argo log` | 实时查看运行日志（`Ctrl+C` 退出） |
+| `argo edit` | 修改核心配置参数（UUID/密码/端口/隧道Token/TG推送） |
+| `argo update` | 一键检查并拉取最新服务端代码并平滑重启 |
+| `argo uninstall`| 彻底卸载 Argo 服务与所有配置文件 |
+| `argo help` | 打印常用命令行帮助目录 |
 
 ---
 
