@@ -47,6 +47,57 @@ log_info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 
+# ── 下载双引擎容灾封装 (curl / wget 互备) ──────────────────────────────────────
+fetch_file() {
+    local url="$1"
+    local dest="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL -H "Cache-Control: no-cache" "$url" -o "$dest" 2>/dev/null
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q --no-cache -O "$dest" "$url" 2>/dev/null
+    else
+        return 1
+    fi
+}
+
+# ── 本地端口可用性检测 ────────────────────────────────────────────────────────
+check_port_available() {
+    local port="$1"
+    [[ -z "$port" ]] && return 0
+    local argo_pid
+    argo_pid=$(pgrep -f "node index.js" | head -1)
+
+    if command -v ss >/dev/null 2>&1; then
+        local line
+        line=$(ss -tlnp 2>/dev/null | grep -E ":${port}\s+")
+        if [[ -n "$line" ]]; then
+            if [[ -n "$argo_pid" ]] && echo "$line" | grep -q "pid=${argo_pid},"; then
+                return 0
+            fi
+            return 1
+        fi
+    elif command -v lsof >/dev/null 2>&1; then
+        local pid
+        pid=$(lsof -t -i :"$port" 2>/dev/null | head -1)
+        if [[ -n "$pid" ]]; then
+            if [[ -n "$argo_pid" && "$pid" == "$argo_pid" ]]; then
+                return 0
+            fi
+            return 1
+        fi
+    elif command -v netstat >/dev/null 2>&1; then
+        local line
+        line=$(netstat -tulpn 2>/dev/null | grep -E ":${port}\s+")
+        if [[ -n "$line" ]]; then
+            if [[ -n "$argo_pid" ]] && echo "$line" | grep -q "${argo_pid}/"; then
+                return 0
+            fi
+            return 1
+        fi
+    fi
+    return 0
+}
+
 # ── 权限与系统检查 ────────────────────────────────────────────────────────────
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -129,8 +180,12 @@ nat64_enable_temp() {
     fi
     [ "$_has_v4" = "1" ] && return 0
 
-    if [ "$_probed" != "1" ] && command -v curl >/dev/null 2>&1; then
-        curl -s --connect-timeout 2 -m 3 https://api.github.com >/dev/null 2>&1 && return 0
+    if [ "$_probed" != "1" ]; then
+        if command -v curl >/dev/null 2>&1; then
+            curl -s --connect-timeout 2 -m 3 https://api.github.com >/dev/null 2>&1 && return 0
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q --spider --timeout=3 -t 1 https://api.github.com >/dev/null 2>&1 && return 0
+        fi
     fi
 
     local _rc="/etc/resolv.conf"
@@ -173,19 +228,19 @@ nat64_restore_temp() {
 # ── 包管理器探测与依赖安装 ───────────────────────────────────────────────────
 install_dependencies() {
     nat64_enable_temp
-    log_info "正在检测并安装基础依赖 (curl, tar, git, ca-certificates)..."
+    log_info "正在检测并安装基础依赖 (curl, wget, tar, git, ca-certificates)..."
     if command -v apk >/dev/null 2>&1; then
         apk update
-        apk add --no-cache curl tar git ca-certificates openssl procps bash nodejs npm
+        apk add --no-cache curl wget tar git ca-certificates openssl procps bash nodejs npm
     elif command -v apt-get >/dev/null 2>&1; then
         apt-get update -y
-        apt-get install -y curl tar git ca-certificates openssl procps
+        apt-get install -y curl wget tar git ca-certificates openssl procps
     elif command -v yum >/dev/null 2>&1; then
-        yum install -y curl tar git ca-certificates openssl procps-ng
+        yum install -y curl wget tar git ca-certificates openssl procps-ng
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y curl tar git ca-certificates openssl procps-ng
+        dnf install -y curl wget tar git ca-certificates openssl procps-ng
     elif command -v pacman >/dev/null 2>&1; then
-        pacman -Sy --noconfirm curl tar git ca-certificates openssl procps-ng
+        pacman -Sy --noconfirm curl wget tar git ca-certificates openssl procps-ng
     fi
 }
 
@@ -212,13 +267,25 @@ ensure_nodejs() {
         if command -v apk >/dev/null 2>&1; then
             apk add --no-cache nodejs npm
         elif command -v apt-get >/dev/null 2>&1; then
-            curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+            if command -v curl >/dev/null 2>&1; then
+                curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+            else
+                wget -qO- https://deb.nodesource.com/setup_20.x | bash -
+            fi
             apt-get install -y nodejs
         elif command -v dnf >/dev/null 2>&1; then
-            curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+            if command -v curl >/dev/null 2>&1; then
+                curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+            else
+                wget -qO- https://rpm.nodesource.com/setup_20.x | bash -
+            fi
             dnf install -y nodejs
         elif command -v yum >/dev/null 2>&1; then
-            curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+            if command -v curl >/dev/null 2>&1; then
+                curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+            else
+                wget -qO- https://rpm.nodesource.com/setup_20.x | bash -
+            fi
             yum install -y nodejs
         fi
 
@@ -306,10 +373,16 @@ quick_install_wizard() {
     if [[ "$is_unattended" -eq 1 ]]; then
         final_port="$def_port"
         echo -e "${WHITE}3. 本地监听端口   :${NC} ${GREEN}${final_port}${NC}"
+        if ! check_port_available "$final_port"; then
+            log_warn "检测到端口 ${final_port} 已被系统其他程序占用，启动时可能冲突！"
+        fi
     else
         echo -e "\n${WHITE}3. 本地监听端口${NC} (回车默认: ${GREEN}${def_port}${NC})"
         read -rp "   请输入端口: " input_port
         final_port="${input_port:-$def_port}"
+        if ! check_port_available "$final_port"; then
+            log_warn "检测到端口 ${final_port} 已被系统其他程序占用，启动时可能冲突！"
+        fi
     fi
     set_env "PORT" "$final_port"
 
@@ -429,6 +502,9 @@ config_menu() {
                 echo -e "\n当前端口: ${GREEN}${cur_port}${NC}"
                 read -rp "请输入新的本地监听端口 (留空保持原值): " new_val
                 if [[ -n "$new_val" ]]; then
+                    if ! check_port_available "$new_val"; then
+                        log_warn "检测到端口 ${new_val} 已被系统其他程序占用，启动时可能冲突！"
+                    fi
                     set_env "PORT" "$new_val"
                     modified=1
                 fi
@@ -514,17 +590,17 @@ deploy_core() {
     mkdir -p "$APP_DIR/nodejs"
 
     log_info "正在获取最新 Argo 服务端代码..."
-    curl -fsSL "${REPO_RAW}/nodejs/index.js" -o "$APP_DIR/nodejs/index.js"
-    curl -fsSL "${REPO_RAW}/nodejs/package.json" -o "$APP_DIR/nodejs/package.json"
-    curl -fsSL "${REPO_RAW}/nodejs/index.html" -o "$APP_DIR/nodejs/index.html"
+    fetch_file "${REPO_RAW}/nodejs/index.js" "$APP_DIR/nodejs/index.js"
+    fetch_file "${REPO_RAW}/nodejs/package.json" "$APP_DIR/nodejs/package.json"
+    fetch_file "${REPO_RAW}/nodejs/index.html" "$APP_DIR/nodejs/index.html"
 
     log_info "正在安装 Node.js 依赖..."
     cd "$APP_DIR/nodejs" || exit 1
     npm install --omit=dev --silent
 
     # 下载最新实体脚本并更新全局快捷命令 (同时支持 argo 与短命令 ag)
-    curl -fsSL -H "Cache-Control: no-cache" "${REPO_RAW}/argo.sh" -o "$APP_DIR/argo.sh" 2>/dev/null || true
-    chmod +x "$APP_DIR/argo.sh"
+    fetch_file "${REPO_RAW}/argo.sh" "$APP_DIR/argo.sh" || true
+    chmod +x "$APP_DIR/argo.sh" 2>/dev/null || true
     ln -sf "$APP_DIR/argo.sh" "$BIN_LINK" 2>/dev/null || true
     chmod +x "$BIN_LINK" 2>/dev/null || true
     ln -sf "$APP_DIR/argo.sh" "/usr/local/bin/ag" 2>/dev/null || true
@@ -615,6 +691,15 @@ check_status() {
     fi
 }
 
+# ── 提取临时穿透域名 ──────────────────────────────────────────────────────────
+extract_temp_domain() {
+    if [[ "$INIT_TYPE" == "systemd" ]]; then
+        journalctl -u "$SVC_NAME" --no-pager -n 50 2>/dev/null | grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' | tail -1
+    else
+        grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$OPENRC_LOG" 2>/dev/null | tail -1
+    fi
+}
+
 # ── 节点与订阅展示 ────────────────────────────────────────────────────────────
 show_subscription() {
     echo -e "\n${CYAN}================= 🚀 Argo 节点订阅与配置 ================${NC}"
@@ -629,17 +714,26 @@ show_subscription() {
         echo -e "\n${CYAN}========================================================${NC}\n"
     fi
 
-    # 从日志中提取最新域名与信息
+    # 获取穿透域名 (固定隧道直接使用配置，临时隧道则智能轮询日志提取)
     local domain=""
-    if [[ "$INIT_TYPE" == "systemd" ]]; then
-        domain=$(journalctl -u "$SVC_NAME" --no-pager -n 50 2>/dev/null | grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' | tail -1)
-    else
-        domain=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$OPENRC_LOG" 2>/dev/null | tail -1)
-    fi
+    local fixed_domain
+    fixed_domain=$(get_env "ARGO_DOMAIN")
 
-    if [[ -z "$domain" ]]; then
-        domain=$(get_env "ARGO_DOMAIN")
-        [[ -n "$domain" ]] && domain="https://${domain}"
+    if [[ -n "$fixed_domain" ]]; then
+        domain="https://${fixed_domain}"
+    else
+        domain=$(extract_temp_domain)
+        if [[ -z "$domain" ]] && svc_is_active; then
+            echo -ne "${YELLOW}正在等待 Cloudflare Argo 临时穿透隧道就绪...${NC}"
+            local retry=0
+            while [[ -z "$domain" && $retry -lt 8 ]]; do
+                sleep 1
+                echo -ne "."
+                domain=$(extract_temp_domain)
+                ((retry++))
+            done
+            echo -e ""
+        fi
     fi
 
     if [[ -n "$domain" ]]; then
@@ -649,7 +743,7 @@ show_subscription() {
         echo -e "穿透地址: ${WHITE}${domain}${NC}"
         echo -e "订阅链接: ${GREEN}${domain}/${sub_path}${NC}"
     else
-        echo -e "${YELLOW}服务启动中，请稍后查看日志或稍后再次选择本项查询域名。${NC}"
+        echo -e "${YELLOW}服务已启动，隧道建立中，请稍后输入 argo sub 查询最新域名。${NC}"
     fi
     echo -e "${CYAN}========================================================${NC}\n"
 }
@@ -674,7 +768,7 @@ do_install() {
     quick_install_wizard
     deploy_core
     install_service
-    sleep 3
+    sleep 1
     show_subscription
 }
 
@@ -779,8 +873,8 @@ main_menu() {
             check_root
             nat64_enable_temp
             log_info "正在从 GitHub 拉取最新脚本与服务端核心..."
-            curl -fsSL -H "Cache-Control: no-cache" "${REPO_RAW}/argo.sh" -o "$APP_DIR/argo.sh" 2>/dev/null || true
-            chmod +x "$APP_DIR/argo.sh"
+            fetch_file "${REPO_RAW}/argo.sh" "$APP_DIR/argo.sh" || true
+            chmod +x "$APP_DIR/argo.sh" 2>/dev/null || true
             ln -sf "$APP_DIR/argo.sh" "$BIN_LINK" 2>/dev/null || true
             ln -sf "$APP_DIR/argo.sh" "/usr/local/bin/ag" 2>/dev/null || true
             deploy_core
@@ -827,7 +921,7 @@ init_shortcut() {
     nat64_enable_temp
     mkdir -p "$APP_DIR"
     if [[ ! -s "$APP_DIR/argo.sh" || "$0" == /dev/fd/* || "$0" == /proc/* ]]; then
-        curl -fsSL -H "Cache-Control: no-cache" "${REPO_RAW}/argo.sh" -o "$APP_DIR/argo.sh" 2>/dev/null || true
+        fetch_file "${REPO_RAW}/argo.sh" "$APP_DIR/argo.sh" || true
         chmod +x "$APP_DIR/argo.sh" 2>/dev/null || true
     fi
     if [[ -s "$APP_DIR/argo.sh" ]]; then
@@ -857,8 +951,8 @@ if [[ -n "$1" ]]; then
         update|upgrade)
             nat64_enable_temp
             log_info "正在拉取最新代码更新..."
-            curl -fsSL -H "Cache-Control: no-cache" "${REPO_RAW}/argo.sh" -o "$APP_DIR/argo.sh" 2>/dev/null || true
-            chmod +x "$APP_DIR/argo.sh"
+            fetch_file "${REPO_RAW}/argo.sh" "$APP_DIR/argo.sh" || true
+            chmod +x "$APP_DIR/argo.sh" 2>/dev/null || true
             ln -sf "$APP_DIR/argo.sh" "$BIN_LINK" 2>/dev/null || true
             ln -sf "$APP_DIR/argo.sh" "/usr/local/bin/ag" 2>/dev/null || true
             deploy_core
