@@ -232,12 +232,13 @@ deploy_core() {
     cd "$APP_DIR/nodejs" || exit 1
     npm install --omit=dev --silent
 
-    # 复制本脚本为全局管理快捷命令 (支持 argo 与短命令 ag)
-    cp -f "$0" "$APP_DIR/argo.sh" 2>/dev/null || true
+    # 下载最新实体脚本并更新全局快捷命令 (同时支持 argo 与短命令 ag)
+    curl -fsSL -H "Cache-Control: no-cache" "${REPO_RAW}/argo.sh" -o "$APP_DIR/argo.sh" 2>/dev/null || true
     chmod +x "$APP_DIR/argo.sh"
-    ln -sf "$APP_DIR/argo.sh" "$BIN_LINK"
-    chmod +x "$BIN_LINK"
+    ln -sf "$APP_DIR/argo.sh" "$BIN_LINK" 2>/dev/null || true
+    chmod +x "$BIN_LINK" 2>/dev/null || true
     ln -sf "$APP_DIR/argo.sh" "/usr/local/bin/ag" 2>/dev/null || true
+    chmod +x "/usr/local/bin/ag" 2>/dev/null || true
 }
 
 # ── 注册 Systemd 守护服务 ─────────────────────────────────────────────────────
@@ -414,10 +415,17 @@ main_menu() {
             ;;
         8)
             check_root
-            log_info "正在拉取最新代码更新..."
+            log_info "正在从 GitHub 拉取最新脚本与服务端核心..."
+            curl -fsSL -H "Cache-Control: no-cache" "${REPO_RAW}/argo.sh" -o "$APP_DIR/argo.sh" 2>/dev/null || true
+            chmod +x "$APP_DIR/argo.sh"
+            ln -sf "$APP_DIR/argo.sh" "$BIN_LINK" 2>/dev/null || true
+            ln -sf "$APP_DIR/argo.sh" "/usr/local/bin/ag" 2>/dev/null || true
             deploy_core
-            systemctl restart "$SVC_NAME"
-            log_info "Argo 已更新至最新版本并重启！"
+            systemctl restart "$SVC_NAME" >/dev/null 2>&1 || true
+            log_info "Argo 脚本与核心已成功更新至最新版本！"
+            echo -e "\n按任意键重新载入最新菜单..."
+            read -n 1 -s -r
+            exec bash "$APP_DIR/argo.sh"
             ;;
         9)
             check_root
@@ -454,6 +462,22 @@ show_help() {
 # ── 脚本入口 ──────────────────────────────────────────────────────────────────
 check_root
 
+# 预置实体脚本与全局快捷命令 (确保无论是否已安装，argo 与 ag 均立即可用)
+init_shortcut() {
+    mkdir -p "$APP_DIR"
+    if [[ ! -s "$APP_DIR/argo.sh" || "$0" == /dev/fd/* || "$0" == /proc/* ]]; then
+        curl -fsSL -H "Cache-Control: no-cache" "${REPO_RAW}/argo.sh" -o "$APP_DIR/argo.sh" 2>/dev/null || true
+        chmod +x "$APP_DIR/argo.sh" 2>/dev/null || true
+    fi
+    if [[ -s "$APP_DIR/argo.sh" ]]; then
+        ln -sf "$APP_DIR/argo.sh" "$BIN_LINK" 2>/dev/null || true
+        chmod +x "$BIN_LINK" 2>/dev/null || true
+        ln -sf "$APP_DIR/argo.sh" "/usr/local/bin/ag" 2>/dev/null || true
+        chmod +x "/usr/local/bin/ag" 2>/dev/null || true
+    fi
+}
+init_shortcut
+
 if [[ -n "$1" ]]; then
     case "$1" in
         install)
@@ -480,8 +504,12 @@ if [[ -n "$1" ]]; then
             ;;
         update|upgrade)
             log_info "正在拉取最新代码更新..."
+            curl -fsSL -H "Cache-Control: no-cache" "${REPO_RAW}/argo.sh" -o "$APP_DIR/argo.sh" 2>/dev/null || true
+            chmod +x "$APP_DIR/argo.sh"
+            ln -sf "$APP_DIR/argo.sh" "$BIN_LINK" 2>/dev/null || true
+            ln -sf "$APP_DIR/argo.sh" "/usr/local/bin/ag" 2>/dev/null || true
             deploy_core
-            systemctl restart "$SVC_NAME"
+            systemctl restart "$SVC_NAME" >/dev/null 2>&1 || true
             log_info "Argo 已更新至最新版本并重启！"
             ;;
         uninstall) uninstall_argo ;;
