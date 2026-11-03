@@ -82,7 +82,21 @@ argo/
 
 ## 🚀 部署指南
 
-### 方式一：Docker 运行（推荐）
+### 方式一：Linux VPS 一键管理脚本（最推荐）
+
+适用于任意 Ubuntu / Debian / CentOS / AlmaLinux / Rocky 等 Linux VPS 服务器，全自动配置环境与守护进程：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/zaofengyue/argo/main/argo.sh)
+```
+
+- **全中文交互面板**：支持一键安装、修改 UUID / 密码 / 端口 / Argo 穿透模式（临时或固定）、配置 TG 推送与探针；
+- **后台守护保活**：自动注册 `systemd` 服务，开机自启，故障自动拉起；
+- **系统快捷指令**：安装后在终端输入 `argo` 即可随时呼出管理菜单、查看 Base64 订阅、实时监控日志、一键更新与卸载。
+
+---
+
+### 方式二：Docker 运行
 
 #### 1. 临时隧道模式（无需任何域名和 Token，开箱即用）
 ```bash
@@ -111,7 +125,7 @@ docker run -d \
 
 ---
 
-### 方式二：Docker Compose 编排
+### 方式三：Docker Compose 编排
 
 创建 `docker-compose.yml`：
 
@@ -142,7 +156,7 @@ docker compose up -d
 
 ---
 
-### 方式三：云端免费 PaaS 容器平台部署（Koyeb、Render、HuggingFace 等）
+### 方式四：云端免费 PaaS 容器平台部署（Koyeb、Render、HuggingFace 等）
 
 1. **仓库构建**：将本项目推送到您的 GitHub 私有或公开仓库。
 2. **选择构建方式**：直接选择 **Dockerfile** 构建。
@@ -151,7 +165,7 @@ docker compose up -d
 
 ---
 
-### 方式四：本地 / VPS 直接运行
+### 方式五：本地 / 源码直接运行
 
 #### 运行 Node.js 版
 ```bash
