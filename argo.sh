@@ -478,14 +478,16 @@ main_menu() {
     check_status
     echo -e "${CYAN}----------------------------------------------------${NC}"
     echo -e " ${GREEN}1.${NC} 安装 Argo"
-    echo -e " ${GREEN}2.${NC} 启动服务"
-    echo -e " ${GREEN}3.${NC} 停止服务"
-    echo -e " ${GREEN}4.${NC} 重启服务"
-    echo -e " ${GREEN}5.${NC} 查看节点"
-    echo -e " ${GREEN}6.${NC} 查看日志"
-    echo -e " ${GREEN}7.${NC} 修改配置"
-    echo -e " ${GREEN}8.${NC} 更新脚本"
-    echo -e " ${RED}9.${NC} 卸载 Argo"
+    echo -e " ${RED}2.${NC} 卸载 Argo"
+    echo -e "${CYAN}----------------------------------------------------${NC}"
+    echo -e " ${GREEN}3.${NC} 启动服务"
+    echo -e " ${GREEN}4.${NC} 停止服务"
+    echo -e " ${GREEN}5.${NC} 重启服务"
+    echo -e "${CYAN}----------------------------------------------------${NC}"
+    echo -e " ${GREEN}6.${NC} 查看节点"
+    echo -e " ${GREEN}7.${NC} 查看日志"
+    echo -e " ${GREEN}8.${NC} 修改配置"
+    echo -e " ${GREEN}9.${NC} 更新脚本"
     echo -e "${CYAN}----------------------------------------------------${NC}"
     echo -e " ${WHITE}0.${NC} 退出脚本"
     echo -e "${CYAN}====================================================${NC}"
@@ -505,31 +507,35 @@ main_menu() {
             ;;
         2)
             check_root
+            uninstall_argo
+            ;;
+        3)
+            check_root
             systemctl start "$SVC_NAME"
             log_info "服务已启动。"
             ;;
-        3)
+        4)
             check_root
             systemctl stop "$SVC_NAME"
             log_info "服务已停止。"
             ;;
-        4)
+        5)
             check_root
             systemctl restart "$SVC_NAME"
             log_info "服务已重启。"
             ;;
-        5)
+        6)
             show_subscription
             ;;
-        6)
+        7)
             echo -e "${YELLOW}按 Ctrl+C 退出实时日志查看...${NC}\n"
             journalctl -u "$SVC_NAME" -f -n 50
             ;;
-        7)
+        8)
             check_root
             config_menu
             ;;
-        8)
+        9)
             check_root
             log_info "正在从 GitHub 拉取最新脚本与服务端核心..."
             curl -fsSL -H "Cache-Control: no-cache" "${REPO_RAW}/argo.sh" -o "$APP_DIR/argo.sh" 2>/dev/null || true
@@ -542,10 +548,6 @@ main_menu() {
             echo -e "\n按任意键重新载入最新菜单..."
             read -n 1 -s -r
             exec bash "$APP_DIR/argo.sh"
-            ;;
-        9)
-            check_root
-            uninstall_argo
             ;;
         0)
             exit 0
