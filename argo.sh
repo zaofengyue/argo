@@ -118,10 +118,10 @@ set_env() {
     fi
 }
 
-# ── 交互式配置输入 ────────────────────────────────────────────────────────────
-configure_service() {
+# ── 首次极速安装向导 (仅交互核心 1~4 项，5~8 项默认预设) ─────────────────────
+quick_install_wizard() {
     echo -e "\n${CYAN}====================================================${NC}"
-    echo -e "${WHITE}           🚀 Argo 服务端配置向导${NC}"
+    echo -e "${WHITE}           🚀 Argo 服务端初始化配置${NC}"
     echo -e "${CYAN}====================================================${NC}\n"
 
     # 1. 核心 UUID
@@ -134,7 +134,7 @@ configure_service() {
             def_uuid="a982ac5f-9acd-4d38-9140-56f0b27c6961"
         fi
     fi
-    echo -e "${WHITE}1. 请设置核心 UUID${NC} (回车默认使用: ${GREEN}${def_uuid}${NC})"
+    echo -e "${WHITE}1. 核心 UUID${NC} (回车默认: ${GREEN}${def_uuid}${NC})"
     read -rp "   请输入 UUID: " input_uuid
     local final_uuid="${input_uuid:-$def_uuid}"
     set_env "UUID" "$final_uuid"
@@ -143,7 +143,7 @@ configure_service() {
     local def_pwd
     def_pwd=$(get_env "PASSWORD")
     [[ -z "$def_pwd" ]] && def_pwd="$final_uuid"
-    echo -e "\n${WHITE}2. 请设置 Trojan 密码${NC} (回车默认复用 UUID: ${GREEN}${final_uuid}${NC})"
+    echo -e "\n${WHITE}2. Trojan 密码${NC} (回车默认复用 UUID: ${GREEN}${final_uuid}${NC})"
     read -rp "   请输入密码: " input_pwd
     set_env "PASSWORD" "${input_pwd:-$def_pwd}"
 
@@ -151,71 +151,189 @@ configure_service() {
     local def_port
     def_port=$(get_env "PORT")
     [[ -z "$def_port" ]] && def_port="3000"
-    echo -e "\n${WHITE}3. 请设置本地 HTTP 监听端口${NC} (回车默认: ${GREEN}${def_port}${NC})"
+    echo -e "\n${WHITE}3. 本地监听端口${NC} (回车默认: ${GREEN}${def_port}${NC})"
     read -rp "   请输入端口: " input_port
     set_env "PORT" "${input_port:-$def_port}"
 
     # 4. 节点名称
     local def_name
     def_name=$(get_env "NAME")
-    echo -e "\n${WHITE}4. 请设置节点自定义标识名称${NC} (回车默认: ${GREEN}自动探测 国家-运营商${NC})"
+    echo -e "\n${WHITE}4. 节点标识名称${NC} (回车默认: ${GREEN}自动探测 国家-运营商${NC})"
     read -rp "   请输入节点名称 (留空自动探测): " input_name
     set_env "NAME" "${input_name:-$def_name}"
 
-    # 5. Argo 隧道模式
-    echo -e "\n${WHITE}5. 请选择 Cloudflare Argo 穿透模式:${NC}"
-    echo -e "   ${GREEN}1.${NC} 临时隧道 (无需域名和凭证，开箱即用，由 Cloudflare 自动分配 trycloudflare.com 域名)"
-    echo -e "   ${GREEN}2.${NC} 固定隧道 (需绑定自己的 Cloudflare 域名与 Tunnel Token)"
-    read -rp "   请输入选项 [1-2] (默认 1): " argo_choice
+    # 5/6/7/8 自动预设默认值，初次安装不在界面打扰，高级配置可进菜单修改
+    [[ -z "$(get_env "ARGO_DOMAIN")" ]] && set_env "ARGO_DOMAIN" ""
+    [[ -z "$(get_env "ARGO_AUTH")" ]] && set_env "ARGO_AUTH" ""
+    [[ -z "$(get_env "CF_PREFER_HOST")" ]] && set_env "CF_PREFER_HOST" "www.visa.com.tw"
+    [[ -z "$(get_env "SUB")" ]] && set_env "SUB" "sub"
 
-    if [[ "$argo_choice" == "2" ]]; then
-        local def_domain def_auth
-        def_domain=$(get_env "ARGO_DOMAIN")
-        def_auth=$(get_env "ARGO_AUTH")
+    log_info "基础参数已配置完毕！高级项可在“修改配置”菜单中随时调整。"
+}
 
-        read -rp "   请输入已绑定的固定隧道域名 (如 tunnel.example.com): " input_domain
-        read -rp "   请输入 Cloudflare Tunnel Token: " input_auth
+# ── 修改配置子菜单 (单项直选修改，留空不改) ──────────────────────────────────
+config_menu() {
+    local modified=0
+    while true; do
+        clear
+        local cur_uuid cur_pwd cur_port cur_name cur_domain cur_auth cur_cf cur_tg_token cur_tg_chat cur_km_domain cur_km_token
+        cur_uuid=$(get_env "UUID")
+        [[ -z "$cur_uuid" ]] && cur_uuid="a982ac5f-9acd-4d38-9140-56f0b27c6961"
+        cur_pwd=$(get_env "PASSWORD")
+        [[ -z "$cur_pwd" ]] && cur_pwd="$cur_uuid"
+        cur_port=$(get_env "PORT")
+        [[ -z "$cur_port" ]] && cur_port="3000"
+        cur_name=$(get_env "NAME")
+        [[ -z "$cur_name" ]] && cur_name="自动探测"
+        cur_domain=$(get_env "ARGO_DOMAIN")
+        [[ -z "$cur_domain" ]] && cur_domain="未配置"
+        cur_auth=$(get_env "ARGO_AUTH")
+        if [[ -n "$cur_auth" ]]; then
+            cur_auth="${cur_auth:0:6}...${cur_auth: -4}"
+        else
+            cur_auth="未配置"
+        fi
+        cur_cf=$(get_env "CF_PREFER_HOST")
+        [[ -z "$cur_cf" ]] && cur_cf="www.visa.com.tw"
 
-        set_env "ARGO_DOMAIN" "${input_domain:-$def_domain}"
-        set_env "ARGO_AUTH" "${input_auth:-$def_auth}"
-    else
-        set_env "ARGO_DOMAIN" ""
-        set_env "ARGO_AUTH" ""
-    fi
+        cur_tg_token=$(get_env "TG_BOT_TOKEN")
+        cur_tg_chat=$(get_env "TG_CHAT_ID")
+        local cur_tg="未配置"
+        [[ -n "$cur_tg_token" && -n "$cur_tg_chat" ]] && cur_tg="已配置"
 
-    # 6. CF 优选域名
-    local def_cf
-    def_cf=$(get_env "CF_PREFER_HOST")
-    [[ -z "$def_cf" ]] && def_cf="www.visa.com.tw"
-    echo -e "\n${WHITE}6. 请设置 Cloudflare 优选域名/IP${NC} (回车默认: ${GREEN}${def_cf}${NC})"
-    read -rp "   请输入优选域名: " input_cf
-    set_env "CF_PREFER_HOST" "${input_cf:-$def_cf}"
+        cur_km_domain=$(get_env "KOMARI_DOMAIN")
+        cur_km_token=$(get_env "KOMARI_TOKEN")
+        local cur_km="未配置"
+        [[ -n "$cur_km_domain" && -n "$cur_km_token" ]] && cur_km="已配置 (${cur_km_domain})"
 
-    # 7. Telegram 推送 (可选)
-    local def_tg_token def_tg_chat
-    def_tg_token=$(get_env "TG_BOT_TOKEN")
-    def_tg_chat=$(get_env "TG_CHAT_ID")
-    echo -e "\n${WHITE}7. 是否启用 Telegram Bot 自动推送订阅? (可选)${NC}"
-    read -rp "   请输入 TG_BOT_TOKEN (回车跳过): " input_tg_token
-    if [[ -n "$input_tg_token" ]]; then
-        read -rp "   请输入 TG_CHAT_ID: " input_tg_chat
-        set_env "TG_BOT_TOKEN" "$input_tg_token"
-        set_env "TG_CHAT_ID" "$input_tg_chat"
-    fi
+        echo -e "${CYAN}====================================================${NC}"
+        echo -e "${WHITE}                  ⚙️  修改配置${NC}"
+        echo -e "${CYAN}====================================================${NC}"
+        echo -e " ${GREEN}1.${NC} 核心 UUID      : ${CYAN}${cur_uuid}${NC}"
+        echo -e " ${GREEN}2.${NC} Trojan 密码    : ${CYAN}${cur_pwd}${NC}"
+        echo -e " ${GREEN}3.${NC} 本地监听端口   : ${CYAN}${cur_port}${NC}"
+        echo -e " ${GREEN}4.${NC} 节点标识名称   : ${CYAN}${cur_name}${NC}"
+        echo -e " ${GREEN}5.${NC} Argo 固定域名  : ${CYAN}${cur_domain}${NC}"
+        echo -e " ${GREEN}6.${NC} Argo 隧道凭证  : ${CYAN}${cur_auth}${NC}"
+        echo -e " ${GREEN}7.${NC} CF 优选域名    : ${CYAN}${cur_cf}${NC}"
+        echo -e " ${GREEN}8.${NC} TG 推送设置    : ${CYAN}${cur_tg}${NC}"
+        echo -e " ${GREEN}9.${NC} Komari 探针    : ${CYAN}${cur_km}${NC}"
+        echo -e "${CYAN}----------------------------------------------------${NC}"
+        echo -e " ${WHITE}0.${NC} 返回主菜单"
+        echo -e "${CYAN}====================================================${NC}"
+        read -rp "请输入要修改的配置项 [0-9]: " cfg_choice
 
-    # 8. Komari 探针 (可选)
-    local def_km_domain def_km_token
-    def_km_domain=$(get_env "KOMARI_DOMAIN")
-    def_km_token=$(get_env "KOMARI_TOKEN")
-    echo -e "\n${WHITE}8. 是否启用 Komari 监控探针? (可选)${NC}"
-    read -rp "   请输入 Komari 服务端域名 (回车跳过): " input_km_domain
-    if [[ -n "$input_km_domain" ]]; then
-        read -rp "   请输入 Komari 探针 Token: " input_km_token
-        set_env "KOMARI_DOMAIN" "$input_km_domain"
-        set_env "KOMARI_TOKEN" "$input_km_token"
-    fi
-
-    log_info "配置参数已成功保存至: ${ENV_FILE}"
+        case "$cfg_choice" in
+            1)
+                echo -e "\n当前 UUID: ${GREEN}${cur_uuid}${NC}"
+                read -rp "请输入新的 UUID (留空保持原值): " new_val
+                if [[ -n "$new_val" ]]; then
+                    set_env "UUID" "$new_val"
+                    modified=1
+                fi
+                ;;
+            2)
+                echo -e "\n当前密码: ${GREEN}${cur_pwd}${NC}"
+                read -rp "请输入新的 Trojan 密码 (留空保持原值): " new_val
+                if [[ -n "$new_val" ]]; then
+                    set_env "PASSWORD" "$new_val"
+                    modified=1
+                fi
+                ;;
+            3)
+                echo -e "\n当前端口: ${GREEN}${cur_port}${NC}"
+                read -rp "请输入新的本地监听端口 (留空保持原值): " new_val
+                if [[ -n "$new_val" ]]; then
+                    set_env "PORT" "$new_val"
+                    modified=1
+                fi
+                ;;
+            4)
+                echo -e "\n当前节点名称: ${GREEN}${cur_name}${NC}"
+                read -rp "请输入新的节点标识 (输入 'none' 清空为自动探测，留空保持原值): " new_val
+                if [[ "$new_val" == "none" ]]; then
+                    set_env "NAME" ""
+                    modified=1
+                elif [[ -n "$new_val" ]]; then
+                    set_env "NAME" "$new_val"
+                    modified=1
+                fi
+                ;;
+            5)
+                echo -e "\n当前固定域名: ${GREEN}${cur_domain}${NC}"
+                read -rp "请输入新的 Argo 固定域名 (输入 'none' 改为临时隧道，留空保持原值): " new_val
+                if [[ "$new_val" == "none" ]]; then
+                    set_env "ARGO_DOMAIN" ""
+                    modified=1
+                elif [[ -n "$new_val" ]]; then
+                    set_env "ARGO_DOMAIN" "$new_val"
+                    modified=1
+                fi
+                ;;
+            6)
+                echo -e "\n当前凭证: ${GREEN}${cur_auth}${NC}"
+                read -rp "请输入 Cloudflare Tunnel Token (输入 'none' 清空，留空保持原值): " new_val
+                if [[ "$new_val" == "none" ]]; then
+                    set_env "ARGO_AUTH" ""
+                    modified=1
+                elif [[ -n "$new_val" ]]; then
+                    set_env "ARGO_AUTH" "$new_val"
+                    modified=1
+                fi
+                ;;
+            7)
+                echo -e "\n当前优选域名: ${GREEN}${cur_cf}${NC}"
+                read -rp "请输入 CF 优选域名或 IP (输入 'none' 恢复默认，留空保持原值): " new_val
+                if [[ "$new_val" == "none" ]]; then
+                    set_env "CF_PREFER_HOST" "www.visa.com.tw"
+                    modified=1
+                elif [[ -n "$new_val" ]]; then
+                    set_env "CF_PREFER_HOST" "$new_val"
+                    modified=1
+                fi
+                ;;
+            8)
+                echo -e "\n当前 TG 推送: ${GREEN}${cur_tg}${NC}"
+                read -rp "请输入 TG_BOT_TOKEN (输入 'none' 关闭推送，留空保持原值): " new_bot
+                if [[ "$new_bot" == "none" ]]; then
+                    set_env "TG_BOT_TOKEN" ""
+                    set_env "TG_CHAT_ID" ""
+                    modified=1
+                elif [[ -n "$new_bot" ]]; then
+                    read -rp "请输入 TG_CHAT_ID: " new_chat
+                    set_env "TG_BOT_TOKEN" "$new_bot"
+                    set_env "TG_CHAT_ID" "$new_chat"
+                    modified=1
+                fi
+                ;;
+            9)
+                echo -e "\n当前 Komari 探针: ${GREEN}${cur_km}${NC}"
+                read -rp "请输入 Komari 服务端域名 (输入 'none' 关闭探针，留空保持原值): " new_domain
+                if [[ "$new_domain" == "none" ]]; then
+                    set_env "KOMARI_DOMAIN" ""
+                    set_env "KOMARI_TOKEN" ""
+                    modified=1
+                elif [[ -n "$new_domain" ]]; then
+                    read -rp "请输入 Komari 探针 Token: " new_token
+                    set_env "KOMARI_DOMAIN" "$new_domain"
+                    set_env "KOMARI_TOKEN" "$new_token"
+                    modified=1
+                fi
+                ;;
+            0)
+                if [[ "$modified" -eq 1 ]]; then
+                    systemctl restart "$SVC_NAME" >/dev/null 2>&1 || true
+                    log_info "配置已修改，Argo 服务已自动重启生效！"
+                    sleep 1.5
+                fi
+                break
+                ;;
+            *)
+                log_error "无效选项，请输入 0-9 之间的数字！"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 # ── 安装 / 更新核心代码 ───────────────────────────────────────────────────────
@@ -379,7 +497,7 @@ main_menu() {
             check_systemd
             install_dependencies
             ensure_nodejs
-            configure_service
+            quick_install_wizard
             deploy_core
             install_service
             sleep 3
@@ -409,9 +527,7 @@ main_menu() {
             ;;
         7)
             check_root
-            configure_service
-            systemctl restart "$SVC_NAME"
-            log_info "配置已重新载入并重启生效！"
+            config_menu
             ;;
         8)
             check_root
@@ -484,7 +600,7 @@ if [[ -n "$1" ]]; then
             check_systemd
             install_dependencies
             ensure_nodejs
-            configure_service
+            quick_install_wizard
             deploy_core
             install_service
             sleep 3
@@ -498,9 +614,7 @@ if [[ -n "$1" ]]; then
         sub)     show_subscription ;;
         log)     journalctl -u "$SVC_NAME" -f -n 50 ;;
         edit|config)
-            configure_service
-            systemctl restart "$SVC_NAME"
-            log_info "配置已重新载入并重启生效！"
+            config_menu
             ;;
         update|upgrade)
             log_info "正在拉取最新代码更新..."
