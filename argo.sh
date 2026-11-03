@@ -47,12 +47,20 @@ log_info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 
-# ── 下载双引擎容灾封装 (curl / wget 互备) ──────────────────────────────────────
+# ── 下载双引擎容灾封装 (curl / wget 互备，自动防 CDN 缓存) ──────────────
 fetch_file() {
     local url="$1"
     local dest="$2"
+    local ts
+    ts=$(date +%s)
+    if [[ "$url" == *"?"* ]]; then
+        url="${url}&_t=${ts}"
+    else
+        url="${url}?_t=${ts}"
+    fi
+
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL -H "Cache-Control: no-cache" "$url" -o "$dest" 2>/dev/null
+        curl -fsSL -H "Cache-Control: no-cache, no-store, must-revalidate" -H "Pragma: no-cache" "$url" -o "$dest" 2>/dev/null
     elif command -v wget >/dev/null 2>&1; then
         wget -q --no-cache -O "$dest" "$url" 2>/dev/null
     else
@@ -440,11 +448,9 @@ get_bbr_status() {
     local cc
     cc=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)
     if [[ "$cc" == "bbr" ]]; then
-        echo "已开启 (BBR)"
-    elif [[ -n "$cc" ]]; then
-        echo "未开启 (${cc})"
+        echo "已开启"
     else
-        echo "未知"
+        echo "未开启"
     fi
 }
 
@@ -452,17 +458,19 @@ manage_bbr() {
     echo -e "\n${CYAN}================= 🚀 TCP BBR 拥塞控制管理 ================${NC}"
     local cur_cc
     cur_cc=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)
-    echo -e "当前系统拥塞控制算法: ${GREEN}${cur_cc:-未知}${NC}"
+    local cur_status="未开启"
+    [[ "$cur_cc" == "bbr" ]] && cur_status="已开启"
+    echo -e "当前 BBR 状态: ${GREEN}${cur_status}${NC}"
 
     if [[ "$cur_cc" == "bbr" ]]; then
         echo -e "${YELLOW}BBR 加速当前处于【已启用】状态。${NC}"
-        read -rp "是否要关闭 BBR 并恢复为默认算法 (cubic)? [y/N]: " choice_bbr
+        read -rp "是否要关闭 BBR 加速? [y/N]: " choice_bbr
         if [[ "$choice_bbr" == "y" || "$choice_bbr" == "Y" ]]; then
             sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf 2>/dev/null || true
             sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf 2>/dev/null || true
             echo "net.ipv4.tcp_congestion_control=cubic" >> /etc/sysctl.conf
             sysctl -p >/dev/null 2>&1 || true
-            log_info "已关闭 BBR，当前拥塞控制算法已切换为: $(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)"
+            log_info "已关闭 BBR 加速！"
         else
             log_info "保持当前 BBR 状态不变。"
         fi
@@ -484,9 +492,9 @@ manage_bbr() {
             local new_cc
             new_cc=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)
             if [[ "$new_cc" == "bbr" ]]; then
-                log_info "TCP BBR 加速已成功开启！当前算法: ${GREEN}bbr${NC}"
+                log_info "TCP BBR 加速已成功开启！"
             else
-                log_warn "BBR 参数已写入，但当前生效算法为: ${new_cc}，可能需要重启系统生效。"
+                log_warn "BBR 参数已写入，但当前生效可能需要重启系统。"
             fi
         else
             log_info "已取消开启 BBR。"
