@@ -250,15 +250,20 @@ set_env() {
     fi
 }
 
-# ── 首次极速安装向导 (仅交互核心 1~4 项，5~8 项默认预设) ─────────────────────
+# ── 极速安装向导 (支持交互式与环境变量无人值守两种模式) ───────────────────────
 quick_install_wizard() {
     echo -e "\n${CYAN}====================================================${NC}"
     echo -e "${WHITE}           🚀 Argo 服务端初始化配置${NC}"
     echo -e "${CYAN}====================================================${NC}\n"
 
+    local is_unattended=0
+    if [[ -n "${UUID:-}" || -n "${PASSWORD:-}" || -n "${PORT:-}" || -n "${NAME:-}" || -n "${ARGO_DOMAIN:-}" || -n "${ARGO_AUTH:-}" || -n "${CF_PREFER_HOST:-}" || -n "${KOMARI_DOMAIN:-}" ]]; then
+        is_unattended=1
+        log_info "检测到外部传入的环境变量，启用无人值守静默配置模式..."
+    fi
+
     # 1. 核心 UUID
-    local def_uuid
-    def_uuid=$(get_env "UUID")
+    local def_uuid="${UUID:-$(get_env "UUID")}"
     if [[ -z "$def_uuid" ]]; then
         if command -v uuidgen >/dev/null 2>&1; then
             def_uuid=$(uuidgen | tr '[:upper:]' '[:lower:]')
@@ -266,42 +271,95 @@ quick_install_wizard() {
             def_uuid="a982ac5f-9acd-4d38-9140-56f0b27c6961"
         fi
     fi
-    echo -e "${WHITE}1. 核心 UUID${NC} (回车默认: ${GREEN}自动生成${NC})"
-    read -rp "   请输入 UUID: " input_uuid
-    local final_uuid="${input_uuid:-$def_uuid}"
+
+    local final_uuid
+    if [[ "$is_unattended" -eq 1 ]]; then
+        final_uuid="$def_uuid"
+        echo -e "${WHITE}1. 核心 UUID      :${NC} ${GREEN}${final_uuid}${NC}"
+    else
+        echo -e "${WHITE}1. 核心 UUID${NC} (回车默认: ${GREEN}自动生成${NC})"
+        read -rp "   请输入 UUID: " input_uuid
+        final_uuid="${input_uuid:-$def_uuid}"
+    fi
     set_env "UUID" "$final_uuid"
 
     # 2. 独立密码
-    local def_pwd
-    def_pwd=$(get_env "PASSWORD")
+    local def_pwd="${PASSWORD:-$(get_env "PASSWORD")}"
     [[ -z "$def_pwd" ]] && def_pwd="$final_uuid"
-    echo -e "\n${WHITE}2. Trojan 密码${NC} (回车默认: ${GREEN}复用UUID${NC})"
-    read -rp "   请输入密码: " input_pwd
-    set_env "PASSWORD" "${input_pwd:-$def_pwd}"
+
+    local final_pwd
+    if [[ "$is_unattended" -eq 1 ]]; then
+        final_pwd="$def_pwd"
+        echo -e "${WHITE}2. Trojan 密码    :${NC} ${GREEN}${final_pwd}${NC}"
+    else
+        echo -e "\n${WHITE}2. Trojan 密码${NC} (回车默认: ${GREEN}复用UUID${NC})"
+        read -rp "   请输入密码: " input_pwd
+        final_pwd="${input_pwd:-$def_pwd}"
+    fi
+    set_env "PASSWORD" "$final_pwd"
 
     # 3. 内部端口
-    local def_port
-    def_port=$(get_env "PORT")
+    local def_port="${PORT:-$(get_env "PORT")}"
     [[ -z "$def_port" ]] && def_port="3000"
-    echo -e "\n${WHITE}3. 本地监听端口${NC} (回车默认: ${GREEN}${def_port}${NC})"
-    read -rp "   请输入端口: " input_port
-    set_env "PORT" "${input_port:-$def_port}"
+
+    local final_port
+    if [[ "$is_unattended" -eq 1 ]]; then
+        final_port="$def_port"
+        echo -e "${WHITE}3. 本地监听端口   :${NC} ${GREEN}${final_port}${NC}"
+    else
+        echo -e "\n${WHITE}3. 本地监听端口${NC} (回车默认: ${GREEN}${def_port}${NC})"
+        read -rp "   请输入端口: " input_port
+        final_port="${input_port:-$def_port}"
+    fi
+    set_env "PORT" "$final_port"
 
     # 4. 节点名称
-    local def_name
-    def_name=$(get_env "NAME")
-    echo -e "\n${WHITE}4. 节点标识名称${NC} (回车默认: ${GREEN}自动探测${NC})"
-    read -rp "   请输入节点名称: " input_name
-    set_env "NAME" "${input_name:-$def_name}"
+    local def_name="${NAME:-$(get_env "NAME")}"
 
-    # 5/6/7/8 自动预设默认值，初次安装不在界面打扰，高级配置可进菜单修改
-    [[ -z "$(get_env "ARGO_DOMAIN")" ]] && set_env "ARGO_DOMAIN" ""
-    [[ -z "$(get_env "ARGO_AUTH")" ]] && set_env "ARGO_AUTH" ""
-    [[ -z "$(get_env "CF_PREFER_HOST")" ]] && set_env "CF_PREFER_HOST" "www.visa.com.tw"
-    [[ -z "$(get_env "SUB")" ]] && set_env "SUB" "sub"
-    [[ -z "$(get_env "LOG_CLEAR_MINUTES")" ]] && set_env "LOG_CLEAR_MINUTES" "0"
+    local final_name
+    if [[ "$is_unattended" -eq 1 ]]; then
+        final_name="$def_name"
+        echo -e "${WHITE}4. 节点标识名称   :${NC} ${GREEN}${final_name:-自动探测}${NC}"
+    else
+        echo -e "\n${WHITE}4. 节点标识名称${NC} (回车默认: ${GREEN}自动探测${NC})"
+        read -rp "   请输入节点名称: " input_name
+        final_name="${input_name:-$def_name}"
+    fi
+    set_env "NAME" "$final_name"
 
-    log_info "基础参数已配置完毕！高级项可在“修改配置”菜单中随时调整。"
+    # 5/6/7/8 高级项处理 (支持外部环境变量直接注入，未传则保留原值或使用默认值)
+    local cur_argo_dom="${ARGO_DOMAIN:-$(get_env "ARGO_DOMAIN")}"
+    set_env "ARGO_DOMAIN" "$cur_argo_dom"
+
+    local cur_argo_auth="${ARGO_AUTH:-$(get_env "ARGO_AUTH")}"
+    set_env "ARGO_AUTH" "$cur_argo_auth"
+
+    local cur_cf="${CF_PREFER_HOST:-$(get_env "CF_PREFER_HOST")}"
+    [[ -z "$cur_cf" ]] && cur_cf="www.visa.com.tw"
+    set_env "CF_PREFER_HOST" "$cur_cf"
+
+    local cur_sub="${SUB:-$(get_env "SUB")}"
+    [[ -z "$cur_sub" ]] && cur_sub="sub"
+    set_env "SUB" "$cur_sub"
+
+    local cur_log_clear="${LOG_CLEAR_MINUTES:-$(get_env "LOG_CLEAR_MINUTES")}"
+    [[ -z "$cur_log_clear" ]] && cur_log_clear="0"
+    set_env "LOG_CLEAR_MINUTES" "$cur_log_clear"
+
+    local cur_km_dom="${KOMARI_DOMAIN:-$(get_env "KOMARI_DOMAIN")}"
+    set_env "KOMARI_DOMAIN" "$cur_km_dom"
+
+    local cur_km_tok="${KOMARI_TOKEN:-$(get_env "KOMARI_TOKEN")}"
+    set_env "KOMARI_TOKEN" "$cur_km_tok"
+
+    if [[ "$is_unattended" -eq 1 ]]; then
+        [[ -n "$cur_argo_dom" ]] && echo -e "${WHITE}5. Argo 固定域名  :${NC} ${GREEN}${cur_argo_dom}${NC}"
+        [[ -n "$cur_argo_auth" ]] && echo -e "${WHITE}6. Argo 隧道凭证  :${NC} ${GREEN}已设置${NC}"
+        echo -e "${WHITE}7. CF 优选域名    :${NC} ${GREEN}${cur_cf}${NC}"
+        [[ -n "$cur_km_dom" ]] && echo -e "${WHITE}8. Komari 探针    :${NC} ${GREEN}${cur_km_dom}${NC}"
+    fi
+
+    log_info "基础参数已配置完毕！"
 }
 
 # ── 修改配置子菜单 (单项直选修改，留空不改) ──────────────────────────────────
@@ -607,6 +665,19 @@ view_logs() {
     fi
 }
 
+# ── 完整部署执行流程 ──────────────────────────────────────────────────────────
+do_install() {
+    check_root
+    check_init_system
+    install_dependencies
+    ensure_nodejs
+    quick_install_wizard
+    deploy_core
+    install_service
+    sleep 3
+    show_subscription
+}
+
 # ── 卸载清理 ──────────────────────────────────────────────────────────────────
 uninstall_argo() {
     echo -e "${RED}确定要彻底卸载 Argo 服务吗? 相关的配置和数据都将被删除！${NC}"
@@ -673,15 +744,7 @@ main_menu() {
 
     case "$choice" in
         1)
-            check_root
-            check_init_system
-            install_dependencies
-            ensure_nodejs
-            quick_install_wizard
-            deploy_core
-            install_service
-            sleep 3
-            show_subscription
+            do_install
             ;;
         2)
             check_root
@@ -779,14 +842,7 @@ init_shortcut
 if [[ -n "$1" ]]; then
     case "$1" in
         install)
-            check_init_system
-            install_dependencies
-            ensure_nodejs
-            quick_install_wizard
-            deploy_core
-            install_service
-            sleep 3
-            show_subscription
+            do_install
             ;;
         menu)    main_menu ;;
         start)   svc_start; log_info "服务已启动。" ;;
@@ -816,6 +872,12 @@ if [[ -n "$1" ]]; then
             ;;
     esac
 else
+    # 无参数时：若检测到传入了外部环境变量，则直接触发无人值守一键安装
+    if [[ -n "${UUID:-}" || -n "${PASSWORD:-}" || -n "${PORT:-}" || -n "${NAME:-}" || -n "${ARGO_DOMAIN:-}" || -n "${ARGO_AUTH:-}" ]]; then
+        do_install
+        exit 0
+    fi
+
     while true; do
         main_menu
         echo -e "\n按任意键返回主菜单..."
