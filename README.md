@@ -3,30 +3,6 @@
 > **Zero-Binary (零外部内核) 纯原生穿透代理系统**  
 ---
 
-## ⚙️ 环境变量配置
-
-所有配置项均支持通过**环境变量**注入（留空则自动使用安全预设值）：
-
-| 环境变量 | 默认值 | 说明 |
-| :--- | :--- | :--- |
-| `UUID` | `a982ac5f-9acd-4d38-9140-56f0b27c6961` | 核心连接 UUID（VLESS 鉴权） |
-| `PASSWORD` | 复用 `UUID` | Trojan 密码（留空默认直接复用 UUID） |
-| `PORT` | `3000` | 内部 HTTP 监听端口 |
-| `SUB` | `sub` | 订阅路径后缀（即访问 `https://域名/sub`） |
-| `NAME` | 自动识别 | 自定义节点标识（留空自动识别并格式化为 `国家-运营商`，如 `US-Cloudflare`） |
-| `ARGO_DOMAIN` | 留空 | 固定隧道域名（如 `myargo.example.com`，留空则自动申请临时隧道） |
-| `ARGO_AUTH` | 留空 | 固定隧道 Token 凭证（留空使用临时隧道） |
-| `ARGO_PROTOCOL` | 留空 | Argo 连接协议（留空由 cloudflared 自动选择，可选 `http2`、`quic`） |
-| `CF_PREFER_HOST`| `www.visa.com.tw` | 节点连接中的 Cloudflare 优选域名或优选 IP |
-| `KOMARI_DOMAIN` | 留空 | Komari 服务端域名/地址（留空不启用探针） |
-| `KOMARI_TOKEN`  | 留空 | Komari 探针密钥 Token |
-| `SHOW_LOG`      | `true` | 是否在控制台打印订阅内容（`true` / `false`） |
-| `LOG_CLEAR_MINUTES` | `2` | 控制台配置打印后自动清屏及清理 `sub.txt` 的时间（分钟，`0` 为不清理） |
-| `TG_BOT_TOKEN`  | 留空 | Telegram Bot Token（用于自动推送订阅信息） |
-| `TG_CHAT_ID`    | 留空 | Telegram Chat ID |
-
----
-
 ## 🚀 部署指南
 
 ### 方式一：Linux VPS 一键管理脚本
@@ -126,13 +102,26 @@ docker compose up -d
 
 ---
 
-## 📱 客户端导入与使用
+## ⚙️ 环境变量配置
 
-服务启动后，可以通过以下途径导入节点：
+所有配置项均支持通过**环境变量**注入（留空则自动使用安全预设值）：
 
-1. **直接订阅导入**：在 v2rayN、Shadowrocket、Clash Verge 等客户端中添加订阅链接：
-   ```text
-   https://<你的穿透域名>/sub
-   ```
-2. **批量复制导入**：复制控制台输出或 Telegram 推送中的 Base64 编码，在客户端中选择“从剪贴板导入”。
-3. **支持客户端**：Sing-box、v2rayN、v2rayNG、Shadowrocket、NekoBox、Clash Verge rev 等主流客户端。
+| 环境变量 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `UUID` | `a982ac5f-9acd-4d38-9140-56f0b27c6961` | 核心连接 UUID（VLESS 鉴权） |
+| `PASSWORD` | 复用 `UUID` | Trojan 密码（留空默认直接复用 UUID） |
+| `PORT` | `3000` | 内部 HTTP 监听端口 |
+| `SUB` | `sub` | 订阅路径后缀（即访问 `https://域名/sub`） |
+| `NAME` | 自动识别 | 自定义节点标识（留空自动识别并格式化为 `国家-运营商`，如 `US-Cloudflare`） |
+| `ARGO_DOMAIN` | 留空 | 固定隧道域名（如 `myargo.example.com`，留空则自动申请临时隧道） |
+| `ARGO_AUTH` | 留空 | 固定隧道 Token 凭证（留空使用临时隧道） |
+| `ARGO_PROTOCOL` | 留空 | Argo 连接协议（留空由 cloudflared 自动选择，可选 `http2`、`quic`） |
+| `CF_PREFER_HOST`| `www.visa.com.tw` | 节点连接中的 Cloudflare 优选域名或优选 IP |
+| `KOMARI_DOMAIN` | 留空 | Komari 服务端域名/地址（留空不启用探针） |
+| `KOMARI_TOKEN`  | 留空 | Komari 探针密钥 Token |
+| `SHOW_LOG`      | `true` | 是否在控制台打印订阅内容（`true` / `false`） |
+| `LOG_CLEAR_MINUTES` | `2` | 控制台配置打印后自动清屏及清理 `sub.txt` 的时间（分钟，`0` 为不清理） |
+| `TG_BOT_TOKEN`  | 留空 | Telegram Bot Token（用于自动推送订阅信息） |
+| `TG_CHAT_ID`    | 留空 | Telegram Chat ID |
+
+---
