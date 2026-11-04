@@ -626,9 +626,9 @@ quick_install_wizard() {
     set_env "KOMARI_TOKEN" "$cur_km_tok"
 
     if [[ "$is_unattended" -eq 1 ]]; then
-        [[ -n "$cur_argo_dom" ]] && echo -e "${WHITE}5. Argo 固定域名  :${NC} ${GREEN}${cur_argo_dom}${NC}"
-        [[ -n "$cur_argo_auth" ]] && echo -e "${WHITE}6. Argo 隧道凭证  :${NC} ${GREEN}已设置${NC}"
-        echo -e "${WHITE}7. CF 优选域名    :${NC} ${GREEN}${cur_cf}${NC}"
+        [[ -n "$cur_argo_dom" && -n "$cur_argo_auth" ]] && echo -e "${WHITE}5. Argo 固定隧道  :${NC} ${GREEN}${cur_argo_dom}${NC}"
+        echo -e "${WHITE}6. CF 优选域名    :${NC} ${GREEN}${cur_cf}${NC}"
+        [[ -n "$cur_argo_proto" ]] && echo -e "${WHITE}7. Argo 隧道协议  :${NC} ${GREEN}${cur_argo_proto}${NC}"
         [[ -n "$cur_km_dom" ]] && echo -e "${WHITE}8. Komari 探针    :${NC} ${GREEN}${cur_km_dom}${NC}"
     fi
 
@@ -711,7 +711,7 @@ config_menu() {
     local modified=0
     while true; do
         clear
-        local cur_uuid cur_pwd cur_port cur_name cur_domain cur_auth cur_cf cur_km_domain cur_km_token cur_bbr
+        local cur_uuid cur_pwd cur_port cur_name cur_domain cur_auth cur_argo cur_cf cur_proto cur_km_domain cur_km_token cur_km cur_bbr
         cur_uuid=$(get_env "UUID")
         [[ -z "$cur_uuid" ]] && cur_uuid="未设置 (启动自动生成)"
         cur_pwd=$(get_env "PASSWORD")
@@ -721,23 +721,20 @@ config_menu() {
         cur_name=$(get_env "NAME")
         [[ -z "$cur_name" ]] && cur_name="自动探测"
         cur_domain=$(get_env "ARGO_DOMAIN")
-        [[ -z "$cur_domain" ]] && cur_domain="未配置"
         cur_auth=$(get_env "ARGO_AUTH")
-        if [[ -n "$cur_auth" ]]; then
-            cur_auth="${cur_auth:0:6}...${cur_auth: -4}"
-        else
-            cur_auth="未配置"
-        fi
+        cur_argo="未配置 (使用临时隧道)"
+        [[ -n "$cur_domain" && -n "$cur_auth" ]] && cur_argo="已配置 (${cur_domain})"
+
         cur_cf=$(get_env "CF_PREFER_HOST")
         [[ -z "$cur_cf" ]] && cur_cf="www.visa.com.tw"
 
+        cur_proto=$(get_env "ARGO_PROTOCOL")
+        [[ -z "$cur_proto" ]] && cur_proto="auto (自动协商)"
+
         cur_km_domain=$(get_env "KOMARI_DOMAIN")
         cur_km_token=$(get_env "KOMARI_TOKEN")
-        local cur_km="未配置"
+        cur_km="未配置"
         [[ -n "$cur_km_domain" && -n "$cur_km_token" ]] && cur_km="已配置 (${cur_km_domain})"
-
-        local cur_proto=$(get_env "ARGO_PROTOCOL")
-        [[ -z "$cur_proto" ]] && cur_proto="auto (自动)"
 
         cur_bbr=$(get_bbr_status)
 
@@ -748,16 +745,15 @@ config_menu() {
         echo -e " ${GREEN}2.${NC} Trojan 密码    : ${CYAN}${cur_pwd}${NC}"
         echo -e " ${GREEN}3.${NC} 本地监听端口   : ${CYAN}${cur_port}${NC}"
         echo -e " ${GREEN}4.${NC} 节点标识名称   : ${CYAN}${cur_name}${NC}"
-        echo -e " ${GREEN}5.${NC} Argo 固定域名  : ${CYAN}${cur_domain}${NC}"
-        echo -e " ${GREEN}6.${NC} Argo 隧道凭证  : ${CYAN}${cur_auth}${NC}"
-        echo -e " ${GREEN}7.${NC} CF 优选域名    : ${CYAN}${cur_cf}${NC}"
-        echo -e " ${GREEN}8.${NC} Argo 隧道协议  : ${CYAN}${cur_proto}${NC}"
-        echo -e " ${GREEN}9.${NC} Komari 探针    : ${CYAN}${cur_km}${NC}"
-        echo -e " ${GREEN}10.${NC} TCP BBR 加速  : ${CYAN}${cur_bbr}${NC}"
+        echo -e " ${GREEN}5.${NC} Argo 固定隧道  : ${CYAN}${cur_argo}${NC}"
+        echo -e " ${GREEN}6.${NC} CF 优选域名    : ${CYAN}${cur_cf}${NC}"
+        echo -e " ${GREEN}7.${NC} Argo 隧道协议  : ${CYAN}${cur_proto}${NC}"
+        echo -e " ${GREEN}8.${NC} Komari 探针    : ${CYAN}${cur_km}${NC}"
+        echo -e " ${GREEN}9.${NC} TCP BBR 加速   : ${CYAN}${cur_bbr}${NC}"
         echo -e "${CYAN}----------------------------------------------------${NC}"
         echo -e " ${WHITE}0.${NC} 返回主菜单"
         echo -e "${CYAN}====================================================${NC}"
-        read -rp "请输入要修改的配置项 [0-10]: " cfg_choice
+        read -rp "请输入要修改的配置项 [0-9]: " cfg_choice
 
         case "$cfg_choice" in
             1)
@@ -809,28 +805,28 @@ config_menu() {
                 fi
                 ;;
             5)
-                echo -e "\n当前固定域名: ${GREEN}${cur_domain}${NC}"
-                read -rp "请输入新的 Argo 固定域名 (输入 'none' 改为临时隧道，留空保持原值): " new_val
-                if [[ "$new_val" == "none" ]]; then
+                echo -e "\n当前 Argo 固定隧道: ${GREEN}${cur_argo}${NC}"
+                read -rp "请输入 Argo 固定域名 (输入 'none' 清空并使用临时隧道，留空保持原值): " new_domain
+                if [[ "$new_domain" == "none" ]]; then
                     set_env "ARGO_DOMAIN" ""
+                    set_env "ARGO_AUTH" ""
                     modified=1
-                elif [[ -n "$new_val" ]]; then
-                    set_env "ARGO_DOMAIN" "$new_val"
-                    modified=1
+                    log_info "已清空固定域名与凭证，将自动切换为临时穿透隧道！"
+                elif [[ -n "$new_domain" ]]; then
+                    local def_auth
+                    def_auth=$(get_env "ARGO_AUTH")
+                    read -rp "请输入 Cloudflare Tunnel Token 凭证 (留空保持原值): " new_auth
+                    local final_auth="${new_auth:-$def_auth}"
+                    if [[ -n "$final_auth" ]]; then
+                        set_env "ARGO_DOMAIN" "$new_domain"
+                        set_env "ARGO_AUTH" "$final_auth"
+                        modified=1
+                    else
+                        log_warn "未输入 Token 凭证，固定隧道必须同时具备域名与凭证，修改已取消！"
+                    fi
                 fi
                 ;;
             6)
-                echo -e "\n当前凭证: ${GREEN}${cur_auth}${NC}"
-                read -rp "请输入 Cloudflare Tunnel Token (输入 'none' 清空，留空保持原值): " new_val
-                if [[ "$new_val" == "none" ]]; then
-                    set_env "ARGO_AUTH" ""
-                    modified=1
-                elif [[ -n "$new_val" ]]; then
-                    set_env "ARGO_AUTH" "$new_val"
-                    modified=1
-                fi
-                ;;
-            7)
                 echo -e "\n当前优选域名: ${GREEN}${cur_cf}${NC}"
                 read -rp "请输入 CF 优选域名或 IP (输入 'none' 恢复默认，留空保持原值): " new_val
                 if [[ "$new_val" == "none" ]]; then
@@ -841,7 +837,7 @@ config_menu() {
                     modified=1
                 fi
                 ;;
-            8)
+            7)
                 echo -e "\n当前 Argo 隧道协议: ${GREEN}${cur_proto}${NC}"
                 echo -e "可选值: ${CYAN}quic${NC} (基于 UDP，抗丢包高并发) / ${CYAN}http2${NC} (基于 TCP) / ${CYAN}auto${NC} (由 cloudflared 自动协商)"
                 read -rp "请输入新的协议 (输入 'quic' / 'http2' / 'auto'，留空保持原值): " new_val
@@ -856,7 +852,7 @@ config_menu() {
                     sleep 1.5
                 fi
                 ;;
-            9)
+            8)
                 echo -e "\n当前 Komari 探针: ${GREEN}${cur_km}${NC}"
                 read -rp "请输入 Komari 服务端域名 (输入 'none' 关闭探针，留空保持原值): " new_domain
                 if [[ "$new_domain" == "none" ]]; then
@@ -864,13 +860,20 @@ config_menu() {
                     set_env "KOMARI_TOKEN" ""
                     modified=1
                 elif [[ -n "$new_domain" ]]; then
-                    read -rp "请输入 Komari 探针 Token: " new_token
-                    set_env "KOMARI_DOMAIN" "$new_domain"
-                    set_env "KOMARI_TOKEN" "$new_token"
-                    modified=1
+                    local def_km_tok
+                    def_km_tok=$(get_env "KOMARI_TOKEN")
+                    read -rp "请输入 Komari 探针 Token (留空保持原值): " new_token
+                    local final_km_tok="${new_token:-$def_km_tok}"
+                    if [[ -n "$final_km_tok" ]]; then
+                        set_env "KOMARI_DOMAIN" "$new_domain"
+                        set_env "KOMARI_TOKEN" "$final_km_tok"
+                        modified=1
+                    else
+                        log_warn "未输入探针 Token，修改已取消！"
+                    fi
                 fi
                 ;;
-            10)
+            9)
                 manage_bbr
                 ;;
             0)
