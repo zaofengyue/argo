@@ -128,10 +128,10 @@ function superviseProcess(name, spawnFn) {
 
 // 防崩溃全局防护罩
 process.on('uncaughtException', (err) => {
-  console.error(`[系统防崩溃] 拦截异常: ${err && err.message ? err.message : err}`);
+  console.error('[系统防崩溃] 拦截异常:', (err && err.stack) ? err.stack : err);
 });
 process.on('unhandledRejection', (reason) => {
-  console.warn(`[系统防崩溃] 拦截异步拒绝: ${reason && reason.message ? reason.message : reason}`);
+  console.warn('[系统防崩溃] 拦截异步拒绝:', (reason && reason.stack) ? reason.stack : reason);
 });
 
 // ── 预编译鉴权哈希缓存 ────────────────────────────────────────────────────────
@@ -612,6 +612,7 @@ function processXhttpUplinkData(session, data, seq = null) {
       session.nextUplinkSeq++;
     }
   } else if (seq > session.nextUplinkSeq) {
+    if (session.pendingUplinkMap.has(seq)) return; // 过滤重复 seq，防止缓冲计数器重复累加漂移
     if (!session.isAuthenticated) {
       // 未认证会话允许小额乱序缓冲（单会话 256KB，全局 16MB，15s 超时未认证自动释放）
       if (session.unauthBufferedBytes + data.length > UNAUTH_PER_SESSION_BYTES ||
@@ -806,6 +807,11 @@ const server = http.createServer((req, res) => {
               if (pendingChunksBytes + chunk.length <= MAX_PENDING_BYTES) {
                 pendingChunks.push(chunk);
                 pendingChunksBytes += chunk.length;
+              } else {
+                pendingChunks = [];
+                pendingChunksBytes = 0;
+                if (remoteSocket) remoteSocket.destroy();
+                req.destroy(new Error('Pending buffer overflow (>1MB)'));
               }
             }
           }
@@ -905,6 +911,11 @@ const server = http.createServer((req, res) => {
               if (pendingChunksBytes + chunk.length <= MAX_PENDING_BYTES) {
                 pendingChunks.push(chunk);
                 pendingChunksBytes += chunk.length;
+              } else {
+                pendingChunks = [];
+                pendingChunksBytes = 0;
+                if (remoteSocket) remoteSocket.destroy();
+                req.destroy(new Error('Pending buffer overflow (>1MB)'));
               }
             }
           }
@@ -1013,6 +1024,11 @@ if (WebSocket) {
           if (pendingChunksBytes + buffer.length <= MAX_PENDING_BYTES) {
             pendingChunks.push(buffer);
             pendingChunksBytes += buffer.length;
+          } else {
+            pendingChunks = [];
+            pendingChunksBytes = 0;
+            if (remoteSocket) remoteSocket.destroy();
+            try { ws.close(1009, 'Message too big'); } catch {}
           }
         }
       }
@@ -1067,6 +1083,11 @@ if (WebSocket) {
           if (pendingChunksBytes + buffer.length <= MAX_PENDING_BYTES) {
             pendingChunks.push(buffer);
             pendingChunksBytes += buffer.length;
+          } else {
+            pendingChunks = [];
+            pendingChunksBytes = 0;
+            if (remoteSocket) remoteSocket.destroy();
+            try { ws.close(1009, 'Message too big'); } catch {}
           }
         }
       }

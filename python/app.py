@@ -15,6 +15,7 @@ import urllib.parse
 import uuid
 import socket
 import ipaddress
+import traceback
 from pathlib import Path
 from aiohttp import web, ClientSession, ClientTimeout, WSMsgType
 
@@ -144,8 +145,13 @@ async def supervise_process(name: str, spawn_coro_fn):
 
 # 全局防崩溃异常处理器
 def handle_global_exception(loop, context):
-    msg = context.get("exception", context.get("message", "未知异常"))
-    print(f"[系统防崩溃] 拦截异步异常: {msg}")
+    exc = context.get("exception")
+    if exc:
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        print(f"[系统防崩溃] 拦截异步异常:\n{tb.strip()}")
+    else:
+        msg = context.get("message", "未知异常")
+        print(f"[系统防崩溃] 拦截异步异常: {msg}")
 
 UUID_BYTES = bytes.fromhex(UUID.replace('-', ''))
 TROJAN_HASH_STR = hashlib.sha224(PASSWORD.encode('utf-8')).hexdigest().lower()
@@ -951,6 +957,8 @@ async def process_xhttp_uplink(sess: dict, data: bytes, seq: int = None):
             await dispatch_xhttp_uplink(sess, next_data)
             sess['next_uplink_seq'] += 1
     elif seq > sess['next_uplink_seq']:
+        if seq in sess['pending_uplink_map']:
+            return
         data_len = len(data)
         if not sess.get('is_authenticated'):
             # 未认证会话允许小额乱序缓冲（单会话 256KB，全局 16MB，15s 超时未认证自动释放）
