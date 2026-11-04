@@ -19,8 +19,14 @@ if [ -z "${BASH_VERSION:-}" ]; then
     fi
 fi
 
-export LANG="en_US.UTF-8"
-export LC_ALL="en_US.UTF-8"
+if locale -a 2>/dev/null | grep -qi "^c\.utf-?8$"; then
+    export LC_ALL="C.UTF-8"
+elif locale -a 2>/dev/null | grep -qi "utf-?8"; then
+    export LC_ALL=$(locale -a 2>/dev/null | grep -i "utf-?8" | head -n1)
+else
+    export LC_ALL="C.UTF-8"
+fi
+export LANG="${LC_ALL}"
 
 # ── 颜色定义 ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -460,7 +466,7 @@ ensure_nodejs() {
 get_env() {
     local key="$1"
     if [[ -f "$ENV_FILE" ]]; then
-        grep "^${key}=" "$ENV_FILE" 2>/dev/null | cut -d'=' -f2- | tr -d '"' | tr -d "'"
+        bash -c 'set -a; [ -f "$1" ] && . "$1" && printf "%s" "${!2}"' bash "$ENV_FILE" "$key" 2>/dev/null
     fi
 }
 
@@ -472,7 +478,11 @@ set_env() {
     if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
         sed -i "/^${key}=/d" "$ENV_FILE"
     fi
-    printf '%s=%q\n' "$key" "$val" >> "$ENV_FILE"
+    local escaped="${val//\\/\\\\}"
+    escaped="${escaped//\"/\\\"}"
+    escaped="${escaped//\$/\\\$}"
+    escaped="${escaped//\`/\\\`}"
+    printf '%s="%s"\n' "$key" "$escaped" >> "$ENV_FILE"
 }
 
 # ── 极速安装向导 (支持交互式与环境变量无人值守两种模式) ───────────────────────
@@ -499,14 +509,30 @@ quick_install_wizard() {
         fi
     fi
 
+    local uuid_regex="^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
     local final_uuid
     if [[ "$is_unattended" -eq 1 ]]; then
-        final_uuid="$def_uuid"
+        if [[ -n "$def_uuid" && ! "$def_uuid" =~ $uuid_regex ]]; then
+            log_warn "外部传入的 UUID 格式无效，已自动回退为新生成的随机 UUID！"
+            final_uuid=$(command -v uuidgen >/dev/null 2>&1 && uuidgen | tr '[:upper:]' '[:lower:]' || cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "a982ac5f-9acd-4d38-9140-56f0b27c6961")
+        else
+            final_uuid="$def_uuid"
+        fi
         echo -e "${WHITE}1. 核心 UUID      :${NC} ${GREEN}${final_uuid}${NC}"
     else
         echo -e "${WHITE}1. 核心 UUID${NC} (回车默认: ${GREEN}自动生成${NC})"
-        read -rp "   请输入 UUID: " input_uuid
-        final_uuid="${input_uuid:-$def_uuid}"
+        while true; do
+            read -rp "   请输入 UUID: " input_uuid
+            if [[ -z "$input_uuid" ]]; then
+                final_uuid="$def_uuid"
+                break
+            elif [[ "$input_uuid" =~ $uuid_regex ]]; then
+                final_uuid=$(echo "$input_uuid" | tr '[:upper:]' '[:lower:]')
+                break
+            else
+                log_warn "UUID 格式不正确（必须为标准 8-4-4-4-12 十六进制格式），请重新输入！"
+            fi
+        done
     fi
     set_env "UUID" "$final_uuid"
 
@@ -550,6 +576,7 @@ quick_install_wizard() {
         fi
     fi
     set_env "PORT" "$final_port"
+    set_env "LISTEN_HOST" "127.0.0.1"
     set_env "HOST" "127.0.0.1"
 
     # 4. 节点名称
@@ -722,8 +749,14 @@ config_menu() {
                 echo -e "\n当前 UUID: ${GREEN}${cur_uuid}${NC}"
                 read -rp "请输入新的 UUID (留空保持原值): " new_val
                 if [[ -n "$new_val" ]]; then
-                    set_env "UUID" "$new_val"
-                    modified=1
+                    local uuid_regex="^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+                    if [[ "$new_val" =~ $uuid_regex ]]; then
+                        set_env "UUID" "$(echo "$new_val" | tr '[:upper:]' '[:lower:]')"
+                        modified=1
+                    else
+                        log_error "UUID 格式不合法（必须为 36 位标准十六进制 UUID，例如 8fce614c-83b5-442b-928d-c78278f2e2cb）！"
+                        sleep 2
+                    fi
                 fi
                 ;;
             2)

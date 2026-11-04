@@ -44,7 +44,8 @@ if (!UUID_REGEX.test(UUID)) {
   process.exit(1);
 }
 const PASSWORD        = (PRESET_PASSWORD       || process.env.PASSWORD        || process.env.TROJAN_PASSWORD || UUID).trim();
-const HOST            = (process.env.HOST      || '127.0.0.1').trim();
+const LISTEN_HOST     = (process.env.LISTEN_HOST || process.env.HOST || '127.0.0.1').trim();
+const HOST            = LISTEN_HOST;
 const PORT            = parseInt(process.env.PORT || '3000', 10);
 const SUB_PATH        = (PRESET_SUB            || process.env.SUB             || 'sub').replace(/^\/+/, '');
 let   NODE_NAME       = (PRESET_NAME           || process.env.NAME            || '').trim();
@@ -322,9 +323,11 @@ function generateNodeLinks(host, preferHost) {
 const ALLOW_LAN = process.env.ALLOW_LAN === 'true';
 const blockList = new net.BlockList();
 
-// 1. 本机回环与未指定
-blockList.addSubnet('127.0.0.0', 8);
+// 1. 本机回环、未指定与广播
 blockList.addSubnet('0.0.0.0', 8);
+blockList.addSubnet('127.0.0.0', 8);
+blockList.addAddress('255.255.255.255');
+blockList.addAddress('::', 'ipv6');
 blockList.addAddress('::1', 'ipv6');
 blockList.addSubnet('::ffff:127.0.0.0', 104, 'ipv6');
 
@@ -343,6 +346,17 @@ if (!ALLOW_LAN) {
   blockList.addSubnet('fc00::', 7, 'ipv6');
 }
 
+// 5. 补充特异与保留网段 (NAT64, 6to4, 多播, 基准测试, TEST-NET, IETF保留)
+blockList.addSubnet('64:ff9b::', 96, 'ipv6');
+blockList.addSubnet('2002::', 16, 'ipv6');
+blockList.addSubnet('224.0.0.0', 4);
+blockList.addSubnet('ff00::', 8, 'ipv6');
+blockList.addSubnet('198.18.0.0', 15);
+blockList.addSubnet('192.0.0.0', 24);
+blockList.addSubnet('192.0.2.0', 24);
+blockList.addSubnet('198.51.100.0', 24);
+blockList.addSubnet('203.0.113.0', 24);
+
 function checkIpBlocked(ipStr, family = 'ipv4') {
   try {
     return blockList.check(ipStr, family);
@@ -351,15 +365,33 @@ function checkIpBlocked(ipStr, family = 'ipv4') {
   }
 }
 
+function safeDnsLookup(hostname, options, callback) {
+  dns.lookup(hostname, { all: true }, (err, addresses) => {
+    if (err) return callback(err);
+    if (!addresses || addresses.length === 0) {
+      return callback(new Error(`DNS lookup empty for: ${hostname}`));
+    }
+    const safe = addresses.filter(a => !checkIpBlocked(a.address, a.family === 6 ? 'ipv6' : 'ipv4'));
+    if (safe.length === 0) {
+      return callback(new Error(`All resolved IPs blocked for: ${hostname}`));
+    }
+    if (options && options.all) {
+      callback(null, safe);
+    } else {
+      callback(null, safe[0].address, safe[0].family);
+    }
+  });
+}
+
 function resolveAndConnect(targetHost, targetPort, onConnected, onError) {
   if (!targetHost) {
     if (onError) onError(new Error('Empty targetHost'));
-    return;
+    return null;
   }
   const h = targetHost.toLowerCase().trim().replace(/\.$/, '');
   if (h === 'localhost' || h.endsWith('.internal') || h.endsWith('.local')) {
     if (onError) onError(new Error(`Blocked host: ${targetHost}`));
-    return;
+    return null;
   }
 
   const isIp = net.isIP(h);
@@ -367,27 +399,22 @@ function resolveAndConnect(targetHost, targetPort, onConnected, onError) {
     const family = isIp === 6 ? 'ipv6' : 'ipv4';
     if (checkIpBlocked(h, family)) {
       if (onError) onError(new Error(`Blocked IP: ${targetHost}`));
-      return;
+      return null;
     }
     const socket = net.connect({ host: h, port: targetPort }, () => onConnected(socket));
     if (onError) socket.on('error', onError);
     return socket;
   }
 
-  // 域名：先经 DNS 解析，校验真实 IP，防 DNS 重绑定打穿内网
-  dns.lookup(h, { all: false }, (err, address, family) => {
-    if (err || !address) {
-      if (onError) onError(err || new Error(`DNS lookup failed for ${h}`));
-      return;
-    }
-    const famStr = family === 6 ? 'ipv6' : 'ipv4';
-    if (checkIpBlocked(address, famStr)) {
-      if (onError) onError(new Error(`Resolved to blocked IP: ${address} (${h})`));
-      return;
-    }
-    const socket = net.connect({ host: address, port: targetPort }, () => onConnected(socket));
-    if (onError) socket.on('error', onError);
-  });
+  // 域名：安全 DNS 校验过滤，并开启 autoSelectFamily (RFC 8305 Happy Eyeballs 双栈自动回退)
+  const socket = net.connect({
+    host: h,
+    port: targetPort,
+    lookup: safeDnsLookup,
+    autoSelectFamily: true
+  }, () => onConnected(socket));
+  if (onError) socket.on('error', onError);
+  return socket;
 }
 
 // ── XHTTP (SplitHTTP) 会话多路复用连接池 (双层缓冲保护) ─────────────────────
@@ -408,6 +435,8 @@ function cleanupXhttpSession(sessionId) {
 }
 
 function refreshSessionTimer(session) {
+  // 未认证会话维持 15 秒固定超时，绝不因未认证的 GET/POST 刷新延长
+  if (!session.isAuthenticated) return;
   if (session.timer) clearTimeout(session.timer);
   session.timer = setTimeout(() => cleanupXhttpSession(session.id), 60000);
 }
@@ -441,6 +470,7 @@ function getOrCreateXhttpSession(sessionId, protocol = 'vless') {
       downlinkQueue: [],
       nextUplinkSeq: 0,
       pendingUplinkMap: new Map(),
+      pendingUplinkBytes: 0,
       isParsed: false,
       isConnected: false,
       isAuthenticated: false, // 收到正确密码的握手后才置为 true
@@ -472,7 +502,8 @@ function dispatchUplinkData(session, data) {
     if (parsed) {
       session.isParsed = true;
       session.isAuthenticated = true; // 认证通过！升级为正式活跃会话
-      refreshSessionTimer(session);   // 切换为正常 60s 闲置超时
+      if (session.timer) clearTimeout(session.timer);
+      session.timer = setTimeout(() => cleanupXhttpSession(session.id), 60000); // 切换为正常 60s 闲置超时
 
       resolveAndConnect(parsed.targetHost, parsed.targetPort, (remoteSocket) => {
         session.isConnected = true;
@@ -524,7 +555,7 @@ function dispatchUplinkData(session, data) {
 }
 
 function processXhttpUplinkData(session, data, seq = null) {
-  refreshSessionTimer(session);
+  if (session.isAuthenticated) refreshSessionTimer(session);
   if (seq === null) {
     dispatchUplinkData(session, data);
     return;
@@ -538,13 +569,17 @@ function processXhttpUplinkData(session, data, seq = null) {
     while (session.pendingUplinkMap.has(session.nextUplinkSeq)) {
       const nextData = session.pendingUplinkMap.get(session.nextUplinkSeq);
       session.pendingUplinkMap.delete(session.nextUplinkSeq);
+      session.pendingUplinkBytes = Math.max(0, session.pendingUplinkBytes - nextData.length);
       dispatchUplinkData(session, nextData);
       session.nextUplinkSeq++;
     }
   } else if (seq > session.nextUplinkSeq) {
-    // 提前到达的后序包，放入乱序缓冲区暂存（最多容纳 200 包防止恶意内存膨胀）
-    if (session.pendingUplinkMap.size < 200) {
+    // 未认证会话绝不允许乱序缓冲（防恶意构造空头会话填充内存）
+    if (!session.isAuthenticated) return;
+    // 已认证会话按总字节数限制（最大缓冲 4MB）
+    if (session.pendingUplinkBytes + data.length <= 4 * 1024 * 1024) {
       session.pendingUplinkMap.set(seq, data);
+      session.pendingUplinkBytes += data.length;
     }
   }
 }
@@ -559,7 +594,7 @@ function handleXhttpSession(req, res, pathParts, protocol) {
     res.end('Bad Request');
     return;
   }
-  refreshSessionTimer(session);
+  if (session.isAuthenticated) refreshSessionTimer(session);
 
   if (req.method === 'GET') {
     session.downlinkRes = res;
@@ -657,6 +692,8 @@ const server = http.createServer((req, res) => {
       if (req.method === 'POST') {
         let isParsed = false;
         let remoteSocket = null;
+        let pendingChunks = [];
+        let isEnded = false;
         const chunksQueue = [];
 
         req.on('data', (chunk) => {
@@ -674,8 +711,7 @@ const server = http.createServer((req, res) => {
             const parsed = parseVlessHeader(fullBuf);
             if (parsed) {
               isParsed = true;
-              resolveAndConnect(parsed.targetHost, parsed.targetPort, (sock) => {
-                remoteSocket = sock;
+              const sock = resolveAndConnect(parsed.targetHost, parsed.targetPort, (connectedSock) => {
                 res.writeHead(200, {
                   'Content-Type': 'application/octet-stream',
                   'Transfer-Encoding': 'chunked',
@@ -683,24 +719,37 @@ const server = http.createServer((req, res) => {
                   'Connection': 'keep-alive'
                 });
                 res.write(Buffer.from([0, 0])); // VLESS 握手响应
-                if (parsed.payload.length > 0) remoteSocket.write(parsed.payload);
+                if (parsed.payload.length > 0) connectedSock.write(parsed.payload);
+                if (pendingChunks.length > 0) {
+                  for (const b of pendingChunks) connectedSock.write(b);
+                  pendingChunks = [];
+                }
+                if (isEnded && !connectedSock.destroyed) {
+                  connectedSock.end();
+                }
 
-                remoteSocket.on('data', (d) => {
+                connectedSock.on('data', (d) => {
                   if (!res.write(d)) {
-                    remoteSocket.pause();
+                    connectedSock.pause();
                   }
                 });
-                res.on('drain', () => remoteSocket.resume());
-                remoteSocket.on('close', () => res.end());
-                remoteSocket.on('error', () => res.end());
+                res.on('drain', () => connectedSock.resume());
+                connectedSock.on('close', () => res.end());
+                connectedSock.on('error', () => res.end());
               }, () => {
+                pendingChunks = [];
                 res.writeHead(403, { 'Content-Type': 'text/plain' });
                 res.end('Forbidden');
                 req.destroy();
               });
+              remoteSocket = sock;
             }
           } else {
-            if (remoteSocket && !remoteSocket.destroyed) remoteSocket.write(chunk);
+            if (remoteSocket && !remoteSocket.destroyed && !remoteSocket.connecting) {
+              remoteSocket.write(chunk);
+            } else {
+              pendingChunks.push(chunk);
+            }
           }
         });
 
@@ -708,11 +757,17 @@ const server = http.createServer((req, res) => {
           if (!isParsed) {
             res.writeHead(400, { 'Content-Type': 'text/plain' });
             res.end('Bad Request');
-          } else if (remoteSocket && !remoteSocket.destroyed) {
-            remoteSocket.end();
+          } else {
+            isEnded = true;
+            if (remoteSocket && !remoteSocket.destroyed && !remoteSocket.connecting) {
+              remoteSocket.end();
+            }
           }
         });
-        req.on('error', () => { if (remoteSocket) remoteSocket.destroy(); });
+        req.on('error', () => {
+          pendingChunks = [];
+          if (remoteSocket) remoteSocket.destroy();
+        });
         return;
       }
     }
@@ -725,6 +780,8 @@ const server = http.createServer((req, res) => {
       if (req.method === 'POST') {
         let isParsed = false;
         let remoteSocket = null;
+        let pendingChunks = [];
+        let isEnded = false;
         const chunksQueue = [];
 
         req.on('data', (chunk) => {
@@ -742,32 +799,44 @@ const server = http.createServer((req, res) => {
             const parsed = parseTrojanHeader(fullBuf);
             if (parsed) {
               isParsed = true;
-              resolveAndConnect(parsed.targetHost, parsed.targetPort, (sock) => {
-                remoteSocket = sock;
+              const sock = resolveAndConnect(parsed.targetHost, parsed.targetPort, (connectedSock) => {
                 res.writeHead(200, {
                   'Content-Type': 'application/octet-stream',
                   'Transfer-Encoding': 'chunked',
                   'Cache-Control': 'no-cache, no-store',
                   'Connection': 'keep-alive'
                 });
-                if (parsed.payload.length > 0) remoteSocket.write(parsed.payload);
+                if (parsed.payload.length > 0) connectedSock.write(parsed.payload);
+                if (pendingChunks.length > 0) {
+                  for (const b of pendingChunks) connectedSock.write(b);
+                  pendingChunks = [];
+                }
+                if (isEnded && !connectedSock.destroyed) {
+                  connectedSock.end();
+                }
 
-                remoteSocket.on('data', (d) => {
+                connectedSock.on('data', (d) => {
                   if (!res.write(d)) {
-                    remoteSocket.pause();
+                    connectedSock.pause();
                   }
                 });
-                res.on('drain', () => remoteSocket.resume());
-                remoteSocket.on('close', () => res.end());
-                remoteSocket.on('error', () => res.end());
+                res.on('drain', () => connectedSock.resume());
+                connectedSock.on('close', () => res.end());
+                connectedSock.on('error', () => res.end());
               }, () => {
+                pendingChunks = [];
                 res.writeHead(403, { 'Content-Type': 'text/plain' });
                 res.end('Forbidden');
                 req.destroy();
               });
+              remoteSocket = sock;
             }
           } else {
-            if (remoteSocket && !remoteSocket.destroyed) remoteSocket.write(chunk);
+            if (remoteSocket && !remoteSocket.destroyed && !remoteSocket.connecting) {
+              remoteSocket.write(chunk);
+            } else {
+              pendingChunks.push(chunk);
+            }
           }
         });
 
@@ -775,11 +844,17 @@ const server = http.createServer((req, res) => {
           if (!isParsed) {
             res.writeHead(400, { 'Content-Type': 'text/plain' });
             res.end('Bad Request');
-          } else if (remoteSocket && !remoteSocket.destroyed) {
-            remoteSocket.end();
+          } else {
+            isEnded = true;
+            if (remoteSocket && !remoteSocket.destroyed && !remoteSocket.connecting) {
+              remoteSocket.end();
+            }
           }
         });
-        req.on('error', () => { if (remoteSocket) remoteSocket.destroy(); });
+        req.on('error', () => {
+          pendingChunks = [];
+          if (remoteSocket) remoteSocket.destroy();
+        });
         return;
       }
     }
@@ -821,9 +896,11 @@ if (WebSocket) {
   // VLESS WS 处理
   wssVless.on('connection', (ws) => {
     let remoteSocket = null, isHeaderParsed = false, isWsClosed = false;
+    let pendingChunks = [];
 
     const onEarlyDisconnect = () => {
       isWsClosed = true;
+      pendingChunks = [];
       if (remoteSocket && !remoteSocket.destroyed) remoteSocket.destroy();
     };
     ws.on('close', onEarlyDisconnect);
@@ -836,20 +913,29 @@ if (WebSocket) {
         const parsed = parseVlessHeader(buffer);
         if (!parsed) { ws.close(); return; }
         isHeaderParsed = true;
-        resolveAndConnect(parsed.targetHost, parsed.targetPort, (sock) => {
-          remoteSocket = sock;
+        const sock = resolveAndConnect(parsed.targetHost, parsed.targetPort, (connectedSock) => {
           if (isWsClosed || ws.readyState !== WebSocket.OPEN) {
-            remoteSocket.destroy();
+            connectedSock.destroy();
             return;
           }
           ws.send(Buffer.from([0, 0]));
-          if (parsed.payload.length > 0) remoteSocket.write(parsed.payload);
-          setupDuplexPipe(ws, remoteSocket);
+          if (parsed.payload.length > 0) connectedSock.write(parsed.payload);
+          if (pendingChunks.length > 0) {
+            for (const b of pendingChunks) connectedSock.write(b);
+            pendingChunks = [];
+          }
+          setupDuplexPipe(ws, connectedSock);
         }, () => {
+          pendingChunks = [];
           ws.close();
         });
+        remoteSocket = sock;
       } else {
-        if (remoteSocket && !remoteSocket.destroyed) remoteSocket.write(buffer);
+        if (remoteSocket && !remoteSocket.destroyed && !remoteSocket.connecting) {
+          remoteSocket.write(buffer);
+        } else {
+          pendingChunks.push(buffer);
+        }
       }
     });
   });
@@ -857,9 +943,11 @@ if (WebSocket) {
   // Trojan WS 处理
   wssTrojan.on('connection', (ws) => {
     let remoteSocket = null, isHeaderParsed = false, isWsClosed = false;
+    let pendingChunks = [];
 
     const onEarlyDisconnect = () => {
       isWsClosed = true;
+      pendingChunks = [];
       if (remoteSocket && !remoteSocket.destroyed) remoteSocket.destroy();
     };
     ws.on('close', onEarlyDisconnect);
@@ -872,19 +960,28 @@ if (WebSocket) {
         const parsed = parseTrojanHeader(buffer);
         if (!parsed) { ws.close(); return; }
         isHeaderParsed = true;
-        resolveAndConnect(parsed.targetHost, parsed.targetPort, (sock) => {
-          remoteSocket = sock;
+        const sock = resolveAndConnect(parsed.targetHost, parsed.targetPort, (connectedSock) => {
           if (isWsClosed || ws.readyState !== WebSocket.OPEN) {
-            remoteSocket.destroy();
+            connectedSock.destroy();
             return;
           }
-          if (parsed.payload.length > 0) remoteSocket.write(parsed.payload);
-          setupDuplexPipe(ws, remoteSocket);
+          if (parsed.payload.length > 0) connectedSock.write(parsed.payload);
+          if (pendingChunks.length > 0) {
+            for (const b of pendingChunks) connectedSock.write(b);
+            pendingChunks = [];
+          }
+          setupDuplexPipe(ws, connectedSock);
         }, () => {
+          pendingChunks = [];
           ws.close();
         });
+        remoteSocket = sock;
       } else {
-        if (remoteSocket && !remoteSocket.destroyed) remoteSocket.write(buffer);
+        if (remoteSocket && !remoteSocket.destroyed && !remoteSocket.connecting) {
+          remoteSocket.write(buffer);
+        } else {
+          pendingChunks.push(buffer);
+        }
       }
     });
   });

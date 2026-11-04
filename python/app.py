@@ -3,6 +3,7 @@ Argo - Zero-Binary 纯原生代理服务端
 """
 
 import os
+import sys
 import re
 import time
 import base64
@@ -46,9 +47,10 @@ UUID            = (PRESET_UUID           or os.environ.get('UUID')            or
 UUID_REGEX      = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
 if not UUID_REGEX.match(UUID):
     print(f"[FATAL] 核心 UUID 格式无效: \"{UUID}\"！必须为标准的 32 位十六进制 UUID（例如: 8fce614c-83b5-442b-928d-c78278f2e2cb）")
-    exit(1)
+    sys.exit(1)
 PASSWORD        = (PRESET_PASSWORD       or os.environ.get('PASSWORD')        or os.environ.get('TROJAN_PASSWORD') or UUID).strip()
-HOST            = os.environ.get('HOST', '127.0.0.1').strip()
+LISTEN_HOST     = (os.environ.get('LISTEN_HOST') or os.environ.get('HOST') or '127.0.0.1').strip()
+HOST            = LISTEN_HOST
 PORT            = int(os.environ.get('PORT') or 3000)
 SUB_PATH        = (PRESET_SUB            or os.environ.get('SUB')             or 'sub').lstrip('/')
 NODE_NAME       = (PRESET_NAME           or os.environ.get('NAME')            or '').strip()
@@ -691,13 +693,17 @@ async def handle_sub(request):
 ALLOW_LAN = os.environ.get('ALLOW_LAN', '').lower() in ('true', '1')
 
 BLOCKED_NETWORKS = [
-    ipaddress.ip_network('127.0.0.0/8'),
     ipaddress.ip_network('0.0.0.0/8'),
+    ipaddress.ip_network('127.0.0.0/8'),
     ipaddress.ip_network('169.254.0.0/16'),
     ipaddress.ip_network('100.64.0.0/10'),
-    ipaddress.ip_network('::1/128'),
-    ipaddress.ip_network('::ffff:127.0.0.0/104'),
-    ipaddress.ip_network('fe80::/10'),
+    ipaddress.ip_network('64:ff9b::/96'),
+    ipaddress.ip_network('2002::/16'),
+    ipaddress.ip_network('198.18.0.0/15'),
+    ipaddress.ip_network('192.0.0.0/24'),
+    ipaddress.ip_network('192.0.2.0/24'),
+    ipaddress.ip_network('198.51.100.0/24'),
+    ipaddress.ip_network('203.0.113.0/24'),
 ]
 if not ALLOW_LAN:
     BLOCKED_NETWORKS.extend([
@@ -708,36 +714,62 @@ if not ALLOW_LAN:
     ])
 
 def is_ip_blocked(ip_obj) -> bool:
+    # 归一化 IPv4-mapped IPv6 地址 (如 ::ffff:10.0.0.1 -> 10.0.0.1)
+    if ip_obj.version == 6 and ip_obj.ipv4_mapped:
+        ip_obj = ip_obj.ipv4_mapped
+
+    if ip_obj.is_multicast or ip_obj.is_unspecified or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_reserved:
+        return True
+
     for net_range in BLOCKED_NETWORKS:
         if ip_obj in net_range:
             return True
     return False
 
-async def resolve_and_check(target_host: str):
+async def safe_open_connection(target_host: str, target_port: int):
     if not target_host:
-        return None
+        return None, None
     h = target_host.lower().strip().rstrip('.')
     if h == 'localhost' or h.endswith('.internal') or h.endswith('.local'):
-        return None
+        return None, None
+
+    # 字面量 IP 直接校验
     try:
         ip_obj = ipaddress.ip_address(h)
         if is_ip_blocked(ip_obj):
-            return None
-        return str(ip_obj)
+            return None, None
+        return await asyncio.open_connection(str(ip_obj), target_port)
     except ValueError:
         pass
+    except Exception:
+        return None, None
 
+    # 域名 DNS 解析并按顺序尝试（安全过滤 + RFC 8305 Happy Eyeballs 双栈回退）
     loop = asyncio.get_running_loop()
     try:
-        infos = await loop.getaddrinfo(h, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
-        for _, _, _, _, sockaddr in infos:
-            ip_str = sockaddr[0]
-            ip_obj = ipaddress.ip_address(ip_str)
-            if not is_ip_blocked(ip_obj):
-                return ip_str
-        return None
+        infos = await loop.getaddrinfo(h, target_port, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
     except Exception:
-        return None
+        return None, None
+
+    safe_addrs = []
+    for family, type_, proto, canonname, sockaddr in infos:
+        try:
+            ip_obj = ipaddress.ip_address(sockaddr[0])
+            if not is_ip_blocked(ip_obj):
+                safe_addrs.append(sockaddr)
+        except ValueError:
+            continue
+
+    if not safe_addrs:
+        return None, None
+
+    for sockaddr in safe_addrs:
+        try:
+            return await asyncio.open_connection(sockaddr[0], sockaddr[1])
+        except Exception:
+            continue
+
+    return None, None
 
 # ── XHTTP (SplitHTTP) 会话多路复用连接池 (双层缓冲保护架构) ─────────────────
 MAX_XHTTP_SESSIONS = 5000
@@ -766,18 +798,21 @@ def get_or_create_xhttp_session(session_id: str, protocol: str = 'vless'):
             'uplink_queue': asyncio.Queue(),
             'next_uplink_seq': 0,
             'pending_uplink_map': {},
+            'pending_uplink_bytes': 0,
             'is_parsed': False,
             'is_connected': False,
             'is_authenticated': False,
             'handshake_sent': False,
             'header_buf': bytearray(),
             'closed': False,
+            'created_at': time.time(),
             'last_active': time.time(),
             'tasks': []
         }
         xhttp_sessions[session_id] = sess
     else:
-        sess['last_active'] = time.time()
+        if sess.get('is_authenticated'):
+            sess['last_active'] = time.time()
     return sess
 
 async def xhttp_session_sweeper():
@@ -787,10 +822,13 @@ async def xhttp_session_sweeper():
             now = time.time()
             expired = []
             for sid, s in list(xhttp_sessions.items()):
-                idle = now - s.get('last_active', now)
-                # 未认证的空头会话 15 秒过期，已认证会话 60 秒闲置过期
-                if (not s.get('is_authenticated') and idle > 15) or (s.get('is_authenticated') and idle > 60):
-                    expired.append(sid)
+                # 未认证的空头会话创建超过 15 秒强制销毁；已认证会话闲置超过 60 秒销毁
+                if not s.get('is_authenticated'):
+                    if now - s.get('created_at', now) > 15:
+                        expired.append(sid)
+                else:
+                    if now - s.get('last_active', now) > 60:
+                        expired.append(sid)
             for sid in expired:
                 await cleanup_xhttp_session(sid)
         except asyncio.CancelledError:
@@ -829,18 +867,14 @@ async def dispatch_xhttp_uplink(sess: dict, data: bytes):
         if parsed:
             sess['is_parsed'] = True
             sess['is_authenticated'] = True
-            remote_ip = await resolve_and_check(parsed['target_host'])
-            if not remote_ip:
+            sess['last_active'] = time.time()
+            r_reader, r_writer = await safe_open_connection(parsed['target_host'], parsed['target_port'])
+            if not r_reader:
                 await cleanup_xhttp_session(sess['id'])
                 return
-            try:
-                r_reader, r_writer = await asyncio.open_connection(remote_ip, parsed['target_port'])
-                sess['r_reader'] = r_reader
-                sess['r_writer'] = r_writer
-                sess['is_connected'] = True
-            except Exception:
-                await cleanup_xhttp_session(sess['id'])
-                return
+            sess['r_reader'] = r_reader
+            sess['r_writer'] = r_writer
+            sess['is_connected'] = True
 
             if sess['protocol'] == 'vless' and not sess['handshake_sent']:
                 await sess['downlink_queue'].put(b'\x00\x00')
@@ -882,7 +916,8 @@ async def dispatch_xhttp_uplink(sess: dict, data: bytes):
 async def process_xhttp_uplink(sess: dict, data: bytes, seq: int = None):
     if sess['closed']:
         return
-    sess['last_active'] = time.time()
+    if sess.get('is_authenticated'):
+        sess['last_active'] = time.time()
     if seq is None:
         await dispatch_xhttp_uplink(sess, data)
         return
@@ -894,11 +929,17 @@ async def process_xhttp_uplink(sess: dict, data: bytes, seq: int = None):
 
         while sess['next_uplink_seq'] in sess['pending_uplink_map']:
             next_data = sess['pending_uplink_map'].pop(sess['next_uplink_seq'])
+            sess['pending_uplink_bytes'] = max(0, sess.get('pending_uplink_bytes', 0) - len(next_data))
             await dispatch_xhttp_uplink(sess, next_data)
             sess['next_uplink_seq'] += 1
     elif seq > sess['next_uplink_seq']:
-        if len(sess['pending_uplink_map']) < 200:
+        # 未认证会话绝不允许乱序缓冲（防恶意填充内存）
+        if not sess.get('is_authenticated'):
+            return
+        # 已认证会话最多允许缓冲 4MB
+        if sess.get('pending_uplink_bytes', 0) + len(data) <= 4 * 1024 * 1024:
             sess['pending_uplink_map'][seq] = data
+            sess['pending_uplink_bytes'] = sess.get('pending_uplink_bytes', 0) + len(data)
 
 @routes.get(f"{PATH_XHTTP}/{{session_id}}")
 async def handle_vless_xhttp_get(request):
@@ -999,14 +1040,9 @@ async def handle_xhttp(request):
     if not parsed:
         return web.Response(status=400, text="Bad Request")
 
-    remote_ip = await resolve_and_check(parsed['target_host'])
-    if not remote_ip:
+    r_reader, r_writer = await safe_open_connection(parsed['target_host'], parsed['target_port'])
+    if not r_reader:
         return web.Response(status=403, text="Forbidden")
-
-    try:
-        r_reader, r_writer = await asyncio.open_connection(remote_ip, parsed['target_port'])
-    except Exception:
-        return web.Response(status=502)
 
     resp = web.StreamResponse(status=200, headers={
         'Content-Type': 'application/octet-stream',
@@ -1062,14 +1098,9 @@ async def handle_trojan_xhttp(request):
     if not parsed:
         return web.Response(status=400, text="Bad Request")
 
-    remote_ip = await resolve_and_check(parsed['target_host'])
-    if not remote_ip:
+    r_reader, r_writer = await safe_open_connection(parsed['target_host'], parsed['target_port'])
+    if not r_reader:
         return web.Response(status=403, text="Forbidden")
-
-    try:
-        r_reader, r_writer = await asyncio.open_connection(remote_ip, parsed['target_port'])
-    except Exception:
-        return web.Response(status=502)
 
     resp = web.StreamResponse(status=200, headers={
         'Content-Type': 'application/octet-stream',
@@ -1128,13 +1159,8 @@ async def handle_vless_ws(request):
                     if not parsed:
                         await ws.close()
                         break
-                    remote_ip = await resolve_and_check(parsed['target_host'])
-                    if not remote_ip:
-                        await ws.close()
-                        break
-                    try:
-                        r_reader, r_writer = await asyncio.open_connection(remote_ip, parsed['target_port'])
-                    except Exception:
+                    r_reader, r_writer = await safe_open_connection(parsed['target_host'], parsed['target_port'])
+                    if not r_reader:
                         await ws.close()
                         break
                     await ws.send_bytes(b'\x00\x00')
@@ -1184,13 +1210,8 @@ async def handle_trojan_ws(request):
                     if not parsed:
                         await ws.close()
                         break
-                    remote_ip = await resolve_and_check(parsed['target_host'])
-                    if not remote_ip:
-                        await ws.close()
-                        break
-                    try:
-                        r_reader, r_writer = await asyncio.open_connection(remote_ip, parsed['target_port'])
-                    except Exception:
+                    r_reader, r_writer = await safe_open_connection(parsed['target_host'], parsed['target_port'])
+                    if not r_reader:
                         await ws.close()
                         break
                     if parsed['payload']:
