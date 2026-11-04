@@ -649,7 +649,6 @@ function displayNodeInfo(host) {
     console.log(`📌 节点标识:  ${NODE_NAME}`);
     console.log(`🔑 核心 UUID: ${UUID}`);
     console.log(`🔒 独立密码:  ${PASSWORD}`);
-    console.log(`🌐 穿透域名:  https://${host}`);
     console.log(`📋 订阅地址:  ${subUrl}`);
     console.log(`📁 配置文件:  ${SUB_FILE}\n`);
 

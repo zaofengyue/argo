@@ -815,7 +815,6 @@ show_subscription() {
         local sub_path
         sub_path=$(get_env "SUB")
         [[ -z "$sub_path" ]] && sub_path="sub"
-        echo -e "穿透地址: ${WHITE}${domain}${NC}"
         echo -e "订阅链接: ${GREEN}${domain}/${sub_path}${NC}"
     else
         echo -e "${YELLOW}服务已启动，隧道建立中，请稍后输入 argo sub 查询最新域名。${NC}"

@@ -426,7 +426,6 @@ def display_node_info(host: str):
         print(f"📌 节点标识:  {NODE_NAME}")
         print(f"🔑 核心 UUID: {UUID}")
         print(f"🔒 独立密码:  {PASSWORD}")
-        print(f"🌐 穿透域名:  https://{host}")
         print(f"📋 订阅地址:  {sub_url}")
         print(f"📁 配置文件:  {SUB_FILE}\n")
 
