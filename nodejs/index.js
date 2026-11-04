@@ -13,7 +13,7 @@ const { spawn, spawnSync, execSync } = require('child_process');
 
 // ==================== 预留配置（留空则自动读取环境变量或默认值） ====================
 // ── 1. 基础配置 ──
-const PRESET_UUID              = 'a982ac5f-9acd-4d38-9140-56f0b27c6961'; // 核心 UUID
+const PRESET_UUID              = ''; // 核心 UUID（留空默认读取环境变量 UUID，未设置则自动生成随机 UUID）
 const PRESET_PASSWORD          = ''; // Trojan 密码（留空默认复用 UUID）
 const PRESET_NAME              = ''; // 节点名称（留空默认自动识别 国家-运营商）
 const PRESET_SUB               = ''; // 订阅路径后缀（默认 'sub'，即 /sub）
@@ -35,8 +35,8 @@ const PRESET_TG_BOT_TOKEN      = ''; // Telegram Bot Token
 const PRESET_TG_CHAT_ID        = ''; // Telegram Chat ID
 // ==============================================================================
 
-// ── 变量解析（优先读取 PRESET，其次读取环境变量，最后回退默认值）──────────────
-const UUID            = (PRESET_UUID           || process.env.UUID            || 'a982ac5f-9acd-4d38-9140-56f0b27c6961').trim().toLowerCase();
+// ── 变量解析（优先读取 PRESET，其次读取环境变量，最后自动生成随机 UUID）──────────
+const UUID            = (PRESET_UUID           || process.env.UUID            || crypto.randomUUID()).trim().toLowerCase();
 const PASSWORD        = (PRESET_PASSWORD       || process.env.PASSWORD        || process.env.TROJAN_PASSWORD || UUID).trim();
 const PORT            = parseInt(process.env.PORT || '3000', 10);
 const SUB_PATH        = (PRESET_SUB            || process.env.SUB             || 'sub').replace(/^\/+/, '');
@@ -312,7 +312,16 @@ function generateNodeLinks(host, preferHost) {
 }
 
 // ── XHTTP (SplitHTTP) 会话多路复用连接池 (packet-up / packet-down 架构) ─────
+const MAX_XHTTP_SESSIONS = 5000;
 const xhttpSessions = new Map();
+
+function isBlockedTarget(host) {
+  if (!host) return true;
+  const h = host.toLowerCase().trim();
+  if (h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '0.0.0.0') return true;
+  if (h.startsWith('127.') || h.startsWith('169.254.')) return true;
+  return false;
+}
 
 function cleanupXhttpSession(sessionId) {
   const session = xhttpSessions.get(sessionId);
@@ -333,8 +342,15 @@ function refreshSessionTimer(session) {
 }
 
 function getOrCreateXhttpSession(sessionId, protocol = 'vless') {
+  if (!sessionId || !/^[a-zA-Z0-9_-]{1,64}$/.test(sessionId)) {
+    return null;
+  }
   let session = xhttpSessions.get(sessionId);
   if (!session) {
+    if (xhttpSessions.size >= MAX_XHTTP_SESSIONS) {
+      const oldestKey = xhttpSessions.keys().next().value;
+      if (oldestKey) cleanupXhttpSession(oldestKey);
+    }
     session = {
       id: sessionId,
       protocol,
@@ -368,6 +384,10 @@ function processXhttpUplinkData(session, data) {
       : parseTrojanHeader(session.headerBuf);
 
     if (parsed) {
+      if (isBlockedTarget(parsed.targetHost)) {
+        cleanupXhttpSession(session.id);
+        return;
+      }
       session.isParsed = true;
       const remoteSocket = net.connect({ host: parsed.targetHost, port: parsed.targetPort }, () => {
         session.isConnected = true;
@@ -419,6 +439,11 @@ function processXhttpUplinkData(session, data) {
 function handleXhttpSession(req, res, pathParts, protocol) {
   const sessionId = pathParts[1];
   const session = getOrCreateXhttpSession(sessionId, protocol);
+  if (!session) {
+    res.writeHead(400, { 'Content-Type': 'text/plain' });
+    res.end('Bad Request');
+    return;
+  }
   refreshSessionTimer(session);
 
   if (req.method === 'GET') {
@@ -456,8 +481,16 @@ function handleXhttpSession(req, res, pathParts, protocol) {
   }
 
   if (req.method === 'POST') {
+    let bodyLen = 0;
     const bodyChunks = [];
-    req.on('data', (chunk) => bodyChunks.push(chunk));
+    req.on('data', (chunk) => {
+      bodyLen += chunk.length;
+      if (bodyLen > 2 * 1024 * 1024) {
+        req.destroy();
+        return;
+      }
+      bodyChunks.push(chunk);
+    });
     req.on('end', () => {
       const data = Buffer.concat(bodyChunks);
       res.writeHead(200, {
@@ -525,6 +558,12 @@ const server = http.createServer((req, res) => {
 
             const parsed = parseVlessHeader(fullBuf);
             if (parsed) {
+              if (isBlockedTarget(parsed.targetHost)) {
+                res.writeHead(403, { 'Content-Type': 'text/plain' });
+                res.end('Forbidden');
+                req.destroy();
+                return;
+              }
               isParsed = true;
               remoteSocket = net.connect({ host: parsed.targetHost, port: parsed.targetPort }, () => {
                 res.writeHead(200, {
@@ -589,6 +628,12 @@ const server = http.createServer((req, res) => {
 
             const parsed = parseTrojanHeader(fullBuf);
             if (parsed) {
+              if (isBlockedTarget(parsed.targetHost)) {
+                res.writeHead(403, { 'Content-Type': 'text/plain' });
+                res.end('Forbidden');
+                req.destroy();
+                return;
+              }
               isParsed = true;
               remoteSocket = net.connect({ host: parsed.targetHost, port: parsed.targetPort }, () => {
                 res.writeHead(200, {
@@ -669,7 +714,7 @@ if (WebSocket) {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       if (!isHeaderParsed) {
         const parsed = parseVlessHeader(buffer);
-        if (!parsed) { ws.close(); return; }
+        if (!parsed || isBlockedTarget(parsed.targetHost)) { ws.close(); return; }
         isHeaderParsed = true;
         remoteSocket = net.connect({ host: parsed.targetHost, port: parsed.targetPort }, () => {
           if (ws.readyState === WebSocket.OPEN) ws.send(Buffer.from([0, 0]));
@@ -690,7 +735,7 @@ if (WebSocket) {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       if (!isHeaderParsed) {
         const parsed = parseTrojanHeader(buffer);
-        if (!parsed) { ws.close(); return; }
+        if (!parsed || isBlockedTarget(parsed.targetHost)) { ws.close(); return; }
         isHeaderParsed = true;
         remoteSocket = net.connect({ host: parsed.targetHost, port: parsed.targetPort }, () => {
           if (parsed.payload.length > 0) remoteSocket.write(parsed.payload);

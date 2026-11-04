@@ -33,6 +33,9 @@ WHITE='\033[1;37m'
 NC='\033[0m'
 
 # ── 路径与常量 ────────────────────────────────────────────────────────────────
+SVC_NAME="argo"
+OPENRC_LOG="/var/log/argo.log"
+
 if [[ $(id -u 2>/dev/null || echo 1) -eq 0 ]]; then
     IS_ROOT=1
     APP_DIR="/opt/argo"
@@ -49,7 +52,6 @@ else
     LOG_FILE="${APP_DIR}/argo.log"
 fi
 ENV_FILE="$APP_DIR/config.env"
-SVC_NAME="argo"
 BIN_LINK="${BIN_DIR}/argo"
 BIN_LINK_AG="${BIN_DIR}/ag"
 PID_FILE="${APP_DIR}/argo.pid"
@@ -459,10 +461,9 @@ set_env() {
     touch "$ENV_FILE"
     chmod 600 "$ENV_FILE"
     if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
-        sed -i "s|^${key}=.*|${key}=\"${val}\"|" "$ENV_FILE"
-    else
-        echo "${key}=\"${val}\"" >> "$ENV_FILE"
+        sed -i "/^${key}=/d" "$ENV_FILE"
     fi
+    echo "${key}=\"${val}\"" >> "$ENV_FILE"
 }
 
 # ── 极速安装向导 (支持交互式与环境变量无人值守两种模式) ───────────────────────
@@ -482,8 +483,10 @@ quick_install_wizard() {
     if [[ -z "$def_uuid" ]]; then
         if command -v uuidgen >/dev/null 2>&1; then
             def_uuid=$(uuidgen | tr '[:upper:]' '[:lower:]')
+        elif [[ -f /proc/sys/kernel/random/uuid ]]; then
+            def_uuid=$(cat /proc/sys/kernel/random/uuid)
         else
-            def_uuid="a982ac5f-9acd-4d38-9140-56f0b27c6961"
+            def_uuid=$(cat /dev/urandom 2>/dev/null | tr -dc 'a-f0-9' | head -c 32 | sed -E 's/(.{8})(.{4})(.{4})(.{4})(.{12})/\1-\2-\3-\4-\5/' || echo "a982ac5f-9acd-4d38-9140-56f0b27c6961")
         fi
     fi
 
@@ -951,8 +954,10 @@ check_status() {
             echo -e "主进程 PID:   ${CYAN}${pid}${NC}"
             echo -e "内存占用:     ${CYAN}${mem:-未知}${NC}"
         fi
+        return 0
     else
         echo -e "Argo 运行状态: ${RED}○ 未运行 (Stopped)${NC}"
+        return 1
     fi
 }
 
@@ -1079,10 +1084,11 @@ uninstall_argo() {
         fi
     fi
 
-    pkill -u "$(id -u)" -f "bridge" 2>/dev/null || true
-    pkill -u "$(id -u)" -f "metrics" 2>/dev/null || true
+    pkill -u "$(id -u)" -f "\.argo-core/bridge" 2>/dev/null || true
+    pkill -u "$(id -u)" -f "\.argo-core/metrics" 2>/dev/null || true
     pkill -u "$(id -u)" -f "node /app/bridge.js" 2>/dev/null || true
-    pkill -u "$(id -u)" -f "node index.js" 2>/dev/null || true
+    pkill -u "$(id -u)" -f "node /app/metrics.js" 2>/dev/null || true
+    pkill -u "$(id -u)" -f "node.*index.js" 2>/dev/null || true
 
     rm -rf "$APP_DIR"
     rm -f "$BIN_LINK" "$BIN_LINK_AG"

@@ -42,7 +42,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/zaofengyue/argo/main/argo.sh
 docker run -d \
   --name argo \
   --restart unless-stopped \
-  -e UUID="a982ac5f-9acd-4d38-9140-56f0b27c6961" \
+  -e UUID="$(uuidgen 2>/dev/null || echo your-custom-uuid)" \
   ghcr.io/zaofengyue/argo:latest
 ```
 > 容器启动后，查看日志即可获取生成的 `trycloudflare.com` 穿透域名和 Base64 订阅：
@@ -77,7 +77,7 @@ services:
     container_name: argo
     restart: unless-stopped
     environment:
-      - UUID=a982ac5f-9acd-4d38-9140-56f0b27c6961
+      - UUID=your-custom-uuid-here # 建议填入自定义唯一 UUID，留空则自动生成
       # 如使用固定隧道请填入以下两项：
       # - ARGO_DOMAIN=your-tunnel.example.com
       # - ARGO_AUTH=eyJhIjoi...
@@ -110,7 +110,7 @@ docker compose up -d
 
 | 环境变量 | 默认值 | 说明 |
 | :--- | :--- | :--- |
-| `UUID` | `a982ac5f-9acd-4d38-9140-56f0b27c6961` | 核心连接 UUID（VLESS 鉴权） |
+| `UUID` | 留空自动生成 | 核心连接 UUID（VLESS 鉴权，建议自定义） |
 | `PASSWORD` | 复用 `UUID` | Trojan 密码（留空默认直接复用 UUID） |
 | `PORT` | `3000` | 内部 HTTP 监听端口 |
 | `SUB` | `sub` | 订阅路径后缀（即访问 `https://域名/sub`） |

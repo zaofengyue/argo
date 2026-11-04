@@ -13,12 +13,13 @@ import asyncio
 import platform
 import subprocess
 import urllib.parse
+import uuid
 from pathlib import Path
 from aiohttp import web, ClientSession, ClientTimeout, WSMsgType
 
 # ==================== 预留配置（留空则自动读取环境变量或默认值） ====================
 # ── 1. 基础配置 ──
-PRESET_UUID              = 'a982ac5f-9acd-4d38-9140-56f0b27c6961' # 核心 UUID
+PRESET_UUID              = '' # 核心 UUID（留空默认读取环境变量 UUID，未设置则自动生成随机 UUID）
 PRESET_PASSWORD          = '' # Trojan 密码（留空默认复用 UUID）
 PRESET_NAME              = '' # 节点名称（留空默认自动识别 国家-运营商）
 PRESET_SUB               = '' # 订阅路径后缀（默认 'sub'，即 /sub）
@@ -40,8 +41,8 @@ PRESET_TG_BOT_TOKEN      = '' # Telegram Bot Token
 PRESET_TG_CHAT_ID        = '' # Telegram Chat ID
 # ==============================================================================
 
-# ── 变量解析（优先读取 PRESET，其次读取环境变量，最后回退默认值）──────────────
-UUID            = (PRESET_UUID           or os.environ.get('UUID')            or 'a982ac5f-9acd-4d38-9140-56f0b27c6961').strip().lower()
+# ── 变量解析（优先读取 PRESET，其次读取环境变量，最后自动生成随机 UUID）──────────
+UUID            = (PRESET_UUID           or os.environ.get('UUID')            or str(uuid.uuid4())).strip().lower()
 PASSWORD        = (PRESET_PASSWORD       or os.environ.get('PASSWORD')        or os.environ.get('TROJAN_PASSWORD') or UUID).strip()
 PORT            = int(os.environ.get('PORT') or 3000)
 SUB_PATH        = (PRESET_SUB            or os.environ.get('SUB')             or 'sub').lstrip('/')
@@ -682,11 +683,27 @@ async def handle_sub(request):
     )
 
 # ── XHTTP (SplitHTTP) 会话多路复用连接池 (packet-up 架构) ───────────────────
+MAX_XHTTP_SESSIONS = 5000
 xhttp_sessions: dict[str, dict] = {}
 
-def get_or_create_xhttp_session(session_id: str, protocol: str = 'vless') -> dict:
+def is_blocked_target(host: str) -> bool:
+    if not host:
+        return True
+    h = host.lower().strip()
+    if h in ('localhost', '127.0.0.1', '::1', '0.0.0.0'):
+        return True
+    if h.startswith('127.') or h.startswith('169.254.'):
+        return True
+    return False
+
+def get_or_create_xhttp_session(session_id: str, protocol: str = 'vless'):
+    if not session_id or not re.match(r'^[a-zA-Z0-9_-]{1,64}$', session_id):
+        return None
     sess = xhttp_sessions.get(session_id)
     if not sess:
+        if len(xhttp_sessions) >= MAX_XHTTP_SESSIONS:
+            oldest_id = next(iter(xhttp_sessions))
+            asyncio.create_task(cleanup_xhttp_session(oldest_id))
         sess = {
             'id': session_id,
             'protocol': protocol,
@@ -699,10 +716,26 @@ def get_or_create_xhttp_session(session_id: str, protocol: str = 'vless') -> dic
             'handshake_sent': False,
             'header_buf': bytearray(),
             'closed': False,
+            'last_active': time.time(),
             'tasks': []
         }
         xhttp_sessions[session_id] = sess
+    else:
+        sess['last_active'] = time.time()
     return sess
+
+async def xhttp_session_sweeper():
+    while True:
+        try:
+            await asyncio.sleep(30)
+            now = time.time()
+            expired = [sid for sid, s in list(xhttp_sessions.items()) if now - s.get('last_active', now) > 60]
+            for sid in expired:
+                await cleanup_xhttp_session(sid)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
 
 async def cleanup_xhttp_session(session_id: str):
     sess = xhttp_sessions.pop(session_id, None)
@@ -726,6 +759,7 @@ async def cleanup_xhttp_session(session_id: str):
 async def process_xhttp_uplink(sess: dict, data: bytes):
     if sess['closed']:
         return
+    sess['last_active'] = time.time()
     if not sess['is_parsed']:
         sess['header_buf'].extend(data)
         if len(sess['header_buf']) > 2048:
@@ -733,6 +767,9 @@ async def process_xhttp_uplink(sess: dict, data: bytes):
             return
         parsed = parse_vless_header(bytes(sess['header_buf'])) if sess['protocol'] == 'vless' else parse_trojan_header(bytes(sess['header_buf']))
         if parsed:
+            if is_blocked_target(parsed['target_host']):
+                await cleanup_xhttp_session(sess['id'])
+                return
             sess['is_parsed'] = True
             try:
                 r_reader, r_writer = await asyncio.open_connection(parsed['target_host'], parsed['target_port'])
@@ -786,6 +823,8 @@ async def handle_vless_xhttp_get(request):
         return web.Response(status=404, text="Not Found")
     session_id = request.match_info['session_id']
     sess = get_or_create_xhttp_session(session_id, 'vless')
+    if not sess:
+        return web.Response(status=400, text="Bad Request")
     resp = web.StreamResponse(status=200, headers={
         'Content-Type': 'application/octet-stream',
         'Transfer-Encoding': 'chunked',
@@ -813,6 +852,8 @@ async def handle_vless_xhttp_post(request):
         return web.Response(status=404, text="Not Found")
     session_id = request.match_info['session_id']
     sess = get_or_create_xhttp_session(session_id, 'vless')
+    if not sess:
+        return web.Response(status=400, text="Bad Request")
     data = await request.read()
     if data:
         await process_xhttp_uplink(sess, data)
@@ -824,6 +865,8 @@ async def handle_trojan_xhttp_get(request):
         return web.Response(status=404, text="Not Found")
     session_id = request.match_info['session_id']
     sess = get_or_create_xhttp_session(session_id, 'trojan')
+    if not sess:
+        return web.Response(status=400, text="Bad Request")
     resp = web.StreamResponse(status=200, headers={
         'Content-Type': 'application/octet-stream',
         'Transfer-Encoding': 'chunked',
@@ -851,6 +894,8 @@ async def handle_trojan_xhttp_post(request):
         return web.Response(status=404, text="Not Found")
     session_id = request.match_info['session_id']
     sess = get_or_create_xhttp_session(session_id, 'trojan')
+    if not sess:
+        return web.Response(status=400, text="Bad Request")
     data = await request.read()
     if data:
         await process_xhttp_uplink(sess, data)
@@ -985,7 +1030,7 @@ async def handle_vless_ws(request):
                 data = msg.data
                 if not r_writer:
                     parsed = parse_vless_header(data)
-                    if not parsed:
+                    if not parsed or is_blocked_target(parsed['target_host']):
                         await ws.close()
                         break
                     r_reader, r_writer = await asyncio.open_connection(parsed['target_host'], parsed['target_port'])
@@ -1033,7 +1078,7 @@ async def handle_trojan_ws(request):
                 data = msg.data
                 if not r_writer:
                     parsed = parse_trojan_header(data)
-                    if not parsed:
+                    if not parsed or is_blocked_target(parsed['target_host']):
                         await ws.close()
                         break
                     r_reader, r_writer = await asyncio.open_connection(parsed['target_host'], parsed['target_port'])
@@ -1082,6 +1127,7 @@ async def on_startup(app):
     print(f"🔒 独立密码: {PASSWORD}")
     print("====================================================")
 
+    asyncio.create_task(xhttp_session_sweeper())
     asyncio.create_task(start_argo_tunnel(PORT))
     asyncio.create_task(start_komari())
 
@@ -1089,6 +1135,11 @@ async def on_cleanup(app):
     global is_shutting_down
     is_shutting_down = True
     print("\n[安全退出] 正在清理子进程并释放资源...")
+    for sid in list(xhttp_sessions.keys()):
+        try:
+            await cleanup_xhttp_session(sid)
+        except Exception:
+            pass
     for proc in list(tracked_processes):
         try:
             proc.terminate()

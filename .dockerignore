@@ -6,3 +6,6 @@ python
 **/.pytest_cache
 node_modules
 sub.txt
+argo.sh
+*.env
+.env*
