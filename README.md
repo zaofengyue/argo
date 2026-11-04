@@ -35,6 +35,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/zaofengyue/argo/main/argo.sh
 
 ### 方式二：Docker 运行
 
+支持 GitHub Container Registry (`ghcr.io/zaofengyue/argo:latest`) 与 Docker Hub (`zaofengyue/argo:latest`) 双镜像源：
+
 #### 1. 临时隧道模式
 ```bash
 docker run -d \
