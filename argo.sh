@@ -136,6 +136,15 @@ check_port_available() {
     return 0
 }
 
+# ── 端口格式与范围验证 ────────────────────────────────────────────────────────
+validate_port() {
+    local port="$1"
+    if [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )); then
+        return 0
+    fi
+    return 1
+}
+
 # ── 权限与系统检查 ────────────────────────────────────────────────────────────
 check_root() {
     if [[ "$IS_ROOT" -eq 0 ]]; then
@@ -531,6 +540,11 @@ quick_install_wizard() {
         echo -e "\n${WHITE}3. 本地监听端口${NC} (回车默认: ${GREEN}${def_port}${NC})"
         read -rp "   请输入端口: " input_port
         final_port="${input_port:-$def_port}"
+        while ! validate_port "$final_port"; do
+            log_warn "端口必须是 1 到 65535 之间的纯数字，请重新输入！"
+            read -rp "   请输入端口: " input_port
+            final_port="${input_port:-$def_port}"
+        done
         if ! check_port_available "$final_port"; then
             log_warn "检测到端口 ${final_port} 已被系统其他程序占用，启动时可能冲突！"
         fi
@@ -660,7 +674,7 @@ config_menu() {
         clear
         local cur_uuid cur_pwd cur_port cur_name cur_domain cur_auth cur_cf cur_km_domain cur_km_token cur_bbr
         cur_uuid=$(get_env "UUID")
-        [[ -z "$cur_uuid" ]] && cur_uuid="a982ac5f-9acd-4d38-9140-56f0b27c6961"
+        [[ -z "$cur_uuid" ]] && cur_uuid="未设置 (启动自动生成)"
         cur_pwd=$(get_env "PASSWORD")
         [[ -z "$cur_pwd" ]] && cur_pwd="$cur_uuid"
         cur_port=$(get_env "PORT")
@@ -723,11 +737,15 @@ config_menu() {
                 echo -e "\n当前端口: ${GREEN}${cur_port}${NC}"
                 read -rp "请输入新的本地监听端口 (留空保持原值): " new_val
                 if [[ -n "$new_val" ]]; then
-                    if ! check_port_available "$new_val"; then
-                        log_warn "检测到端口 ${new_val} 已被系统其他程序占用，启动时可能冲突！"
+                    if ! validate_port "$new_val"; then
+                        log_warn "端口必须是 1 到 65535 之间的纯数字，修改已取消！"
+                    else
+                        if ! check_port_available "$new_val"; then
+                            log_warn "检测到端口 ${new_val} 已被系统其他程序占用，启动时可能冲突！"
+                        fi
+                        set_env "PORT" "$new_val"
+                        modified=1
                     fi
-                    set_env "PORT" "$new_val"
-                    modified=1
                 fi
                 ;;
             4)

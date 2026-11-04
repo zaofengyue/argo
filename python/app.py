@@ -3,10 +3,8 @@ Argo - Zero-Binary 纯原生代理服务端
 """
 
 import os
-import sys
 import re
 import time
-import json
 import base64
 import hashlib
 import asyncio
