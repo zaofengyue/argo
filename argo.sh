@@ -19,10 +19,10 @@ if [ -z "${BASH_VERSION:-}" ]; then
     fi
 fi
 
-if locale -a 2>/dev/null | grep -qi "^c\.utf-?8$"; then
+if locale -a 2>/dev/null | grep -Eqi "^c\.utf-?8$"; then
     export LC_ALL="C.UTF-8"
-elif locale -a 2>/dev/null | grep -qi "utf-?8"; then
-    export LC_ALL=$(locale -a 2>/dev/null | grep -i "utf-?8" | head -n1)
+elif locale -a 2>/dev/null | grep -Eqi "utf-?8"; then
+    export LC_ALL=$(locale -a 2>/dev/null | grep -Ei "utf-?8" | head -n1)
 else
     export LC_ALL="C.UTF-8"
 fi
@@ -466,7 +466,7 @@ ensure_nodejs() {
 get_env() {
     local key="$1"
     if [[ -f "$ENV_FILE" ]]; then
-        bash -c 'set -a; [ -f "$1" ] && . "$1" && printf "%s" "${!2}"' bash "$ENV_FILE" "$key" 2>/dev/null
+        bash -c 'unset "$2"; set -a; [ -f "$1" ] && . "$1" && printf "%s" "${!2}"' bash "$ENV_FILE" "$key" 2>/dev/null
     fi
 }
 
@@ -577,7 +577,6 @@ quick_install_wizard() {
     fi
     set_env "PORT" "$final_port"
     set_env "LISTEN_HOST" "127.0.0.1"
-    set_env "HOST" "127.0.0.1"
 
     # 4. 节点名称
     local def_name="${NAME:-$(get_env "NAME")}"

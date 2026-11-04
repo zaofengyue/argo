@@ -44,7 +44,7 @@ if (!UUID_REGEX.test(UUID)) {
   process.exit(1);
 }
 const PASSWORD        = (PRESET_PASSWORD       || process.env.PASSWORD        || process.env.TROJAN_PASSWORD || UUID).trim();
-const LISTEN_HOST     = (process.env.LISTEN_HOST || process.env.HOST || '127.0.0.1').trim();
+const LISTEN_HOST     = (process.env.LISTEN_HOST || '127.0.0.1').trim();
 const HOST            = LISTEN_HOST;
 const PORT            = parseInt(process.env.PORT || '3000', 10);
 const SUB_PATH        = (PRESET_SUB            || process.env.SUB             || 'sub').replace(/^\/+/, '');
@@ -401,30 +401,58 @@ function resolveAndConnect(targetHost, targetPort, onConnected, onError) {
       if (onError) onError(new Error(`Blocked IP: ${targetHost}`));
       return null;
     }
-    const socket = net.connect({ host: h, port: targetPort }, () => onConnected(socket));
-    if (onError) socket.on('error', onError);
-    return socket;
   }
 
   // 域名：安全 DNS 校验过滤，并开启 autoSelectFamily (RFC 8305 Happy Eyeballs 双栈自动回退)
-  const socket = net.connect({
-    host: h,
-    port: targetPort,
-    lookup: safeDnsLookup,
-    autoSelectFamily: true
-  }, () => onConnected(socket));
-  if (onError) socket.on('error', onError);
+  const connectOpts = isIp
+    ? { host: h, port: targetPort }
+    : { host: h, port: targetPort, lookup: safeDnsLookup, autoSelectFamily: true };
+
+  const socket = net.connect(connectOpts);
+
+  // 10 秒连接超时门禁，防止远端黑洞无限挂起
+  const connTimer = setTimeout(() => {
+    if (socket.connecting) {
+      socket.destroy(new Error(`Connect timeout (10s) to ${targetHost}:${targetPort}`));
+    }
+  }, 10000);
+
+  const initialErrorHandler = (err) => {
+    clearTimeout(connTimer);
+    socket.removeListener('error', initialErrorHandler);
+    if (onError) onError(err);
+  };
+  socket.on('error', initialErrorHandler);
+
+  socket.once('connect', () => {
+    clearTimeout(connTimer);
+    // 连接成功后立即卸载建连错误监听器，防止后续远端 RST 误触发建连失败与重复发头报错
+    socket.removeListener('error', initialErrorHandler);
+    if (onConnected) onConnected(socket);
+  });
+
+  socket.once('close', () => {
+    clearTimeout(connTimer);
+  });
+
   return socket;
 }
 
 // ── XHTTP (SplitHTTP) 会话多路复用连接池 (双层缓冲保护) ─────────────────────
 const MAX_XHTTP_SESSIONS = 5000;
 const xhttpSessions = new Map();
+const UNAUTH_PER_SESSION_BYTES = 256 * 1024;       // 单个未认证会话最多允许暂存 256KB 乱序包（防 seq1 抢先于 seq0）
+const UNAUTH_GLOBAL_BYTES      = 16 * 1024 * 1024;  // 全局所有未认证会话共享暂存上限 16MB（防 DoS 刷爆内存）
+let unauthUplinkBytesGlobal    = 0;
 
 function cleanupXhttpSession(sessionId) {
   const session = xhttpSessions.get(sessionId);
   if (!session) return;
   if (session.timer) clearTimeout(session.timer);
+  if (session.unauthBufferedBytes > 0) {
+    unauthUplinkBytesGlobal = Math.max(0, unauthUplinkBytesGlobal - session.unauthBufferedBytes);
+    session.unauthBufferedBytes = 0;
+  }
   if (session.remoteSocket && !session.remoteSocket.destroyed) {
     session.remoteSocket.destroy();
   }
@@ -471,6 +499,7 @@ function getOrCreateXhttpSession(sessionId, protocol = 'vless') {
       nextUplinkSeq: 0,
       pendingUplinkMap: new Map(),
       pendingUplinkBytes: 0,
+      unauthBufferedBytes: 0,
       isParsed: false,
       isConnected: false,
       isAuthenticated: false, // 收到正确密码的握手后才置为 true
@@ -502,6 +531,10 @@ function dispatchUplinkData(session, data) {
     if (parsed) {
       session.isParsed = true;
       session.isAuthenticated = true; // 认证通过！升级为正式活跃会话
+      if (session.unauthBufferedBytes > 0) {
+        unauthUplinkBytesGlobal = Math.max(0, unauthUplinkBytesGlobal - session.unauthBufferedBytes);
+        session.unauthBufferedBytes = 0;
+      }
       if (session.timer) clearTimeout(session.timer);
       session.timer = setTimeout(() => cleanupXhttpSession(session.id), 60000); // 切换为正常 60s 闲置超时
 
@@ -570,17 +603,31 @@ function processXhttpUplinkData(session, data, seq = null) {
       const nextData = session.pendingUplinkMap.get(session.nextUplinkSeq);
       session.pendingUplinkMap.delete(session.nextUplinkSeq);
       session.pendingUplinkBytes = Math.max(0, session.pendingUplinkBytes - nextData.length);
+      if (!session.isAuthenticated && session.unauthBufferedBytes > 0) {
+        const dec = Math.min(session.unauthBufferedBytes, nextData.length);
+        session.unauthBufferedBytes -= dec;
+        unauthUplinkBytesGlobal = Math.max(0, unauthUplinkBytesGlobal - dec);
+      }
       dispatchUplinkData(session, nextData);
       session.nextUplinkSeq++;
     }
   } else if (seq > session.nextUplinkSeq) {
-    // 未认证会话绝不允许乱序缓冲（防恶意构造空头会话填充内存）
-    if (!session.isAuthenticated) return;
-    // 已认证会话按总字节数限制（最大缓冲 4MB）
-    if (session.pendingUplinkBytes + data.length <= 4 * 1024 * 1024) {
-      session.pendingUplinkMap.set(seq, data);
-      session.pendingUplinkBytes += data.length;
+    if (!session.isAuthenticated) {
+      // 未认证会话允许小额乱序缓冲（单会话 256KB，全局 16MB，15s 超时未认证自动释放）
+      if (session.unauthBufferedBytes + data.length > UNAUTH_PER_SESSION_BYTES ||
+          unauthUplinkBytesGlobal + data.length > UNAUTH_GLOBAL_BYTES) {
+        return;
+      }
+      session.unauthBufferedBytes += data.length;
+      unauthUplinkBytesGlobal += data.length;
+    } else {
+      // 已认证会话按总字节数限制（最大缓冲 4MB）
+      if (session.pendingUplinkBytes + data.length > 4 * 1024 * 1024) {
+        return;
+      }
     }
+    session.pendingUplinkMap.set(seq, data);
+    session.pendingUplinkBytes += data.length;
   }
 }
 
@@ -693,6 +740,8 @@ const server = http.createServer((req, res) => {
         let isParsed = false;
         let remoteSocket = null;
         let pendingChunks = [];
+        let pendingChunksBytes = 0;
+        const MAX_PENDING_BYTES = 1024 * 1024;
         let isEnded = false;
         const chunksQueue = [];
 
@@ -723,6 +772,7 @@ const server = http.createServer((req, res) => {
                 if (pendingChunks.length > 0) {
                   for (const b of pendingChunks) connectedSock.write(b);
                   pendingChunks = [];
+                  pendingChunksBytes = 0;
                 }
                 if (isEnded && !connectedSock.destroyed) {
                   connectedSock.end();
@@ -738,8 +788,13 @@ const server = http.createServer((req, res) => {
                 connectedSock.on('error', () => res.end());
               }, () => {
                 pendingChunks = [];
-                res.writeHead(403, { 'Content-Type': 'text/plain' });
-                res.end('Forbidden');
+                pendingChunksBytes = 0;
+                if (!res.headersSent) {
+                  res.writeHead(403, { 'Content-Type': 'text/plain' });
+                  res.end('Forbidden');
+                } else {
+                  res.end();
+                }
                 req.destroy();
               });
               remoteSocket = sock;
@@ -748,7 +803,10 @@ const server = http.createServer((req, res) => {
             if (remoteSocket && !remoteSocket.destroyed && !remoteSocket.connecting) {
               remoteSocket.write(chunk);
             } else {
-              pendingChunks.push(chunk);
+              if (pendingChunksBytes + chunk.length <= MAX_PENDING_BYTES) {
+                pendingChunks.push(chunk);
+                pendingChunksBytes += chunk.length;
+              }
             }
           }
         });
@@ -766,6 +824,7 @@ const server = http.createServer((req, res) => {
         });
         req.on('error', () => {
           pendingChunks = [];
+          pendingChunksBytes = 0;
           if (remoteSocket) remoteSocket.destroy();
         });
         return;
@@ -781,6 +840,8 @@ const server = http.createServer((req, res) => {
         let isParsed = false;
         let remoteSocket = null;
         let pendingChunks = [];
+        let pendingChunksBytes = 0;
+        const MAX_PENDING_BYTES = 1024 * 1024;
         let isEnded = false;
         const chunksQueue = [];
 
@@ -810,6 +871,7 @@ const server = http.createServer((req, res) => {
                 if (pendingChunks.length > 0) {
                   for (const b of pendingChunks) connectedSock.write(b);
                   pendingChunks = [];
+                  pendingChunksBytes = 0;
                 }
                 if (isEnded && !connectedSock.destroyed) {
                   connectedSock.end();
@@ -825,8 +887,13 @@ const server = http.createServer((req, res) => {
                 connectedSock.on('error', () => res.end());
               }, () => {
                 pendingChunks = [];
-                res.writeHead(403, { 'Content-Type': 'text/plain' });
-                res.end('Forbidden');
+                pendingChunksBytes = 0;
+                if (!res.headersSent) {
+                  res.writeHead(403, { 'Content-Type': 'text/plain' });
+                  res.end('Forbidden');
+                } else {
+                  res.end();
+                }
                 req.destroy();
               });
               remoteSocket = sock;
@@ -835,7 +902,10 @@ const server = http.createServer((req, res) => {
             if (remoteSocket && !remoteSocket.destroyed && !remoteSocket.connecting) {
               remoteSocket.write(chunk);
             } else {
-              pendingChunks.push(chunk);
+              if (pendingChunksBytes + chunk.length <= MAX_PENDING_BYTES) {
+                pendingChunks.push(chunk);
+                pendingChunksBytes += chunk.length;
+              }
             }
           }
         });
@@ -853,6 +923,7 @@ const server = http.createServer((req, res) => {
         });
         req.on('error', () => {
           pendingChunks = [];
+          pendingChunksBytes = 0;
           if (remoteSocket) remoteSocket.destroy();
         });
         return;
@@ -897,10 +968,13 @@ if (WebSocket) {
   wssVless.on('connection', (ws) => {
     let remoteSocket = null, isHeaderParsed = false, isWsClosed = false;
     let pendingChunks = [];
+    let pendingChunksBytes = 0;
+    const MAX_PENDING_BYTES = 1024 * 1024;
 
     const onEarlyDisconnect = () => {
       isWsClosed = true;
       pendingChunks = [];
+      pendingChunksBytes = 0;
       if (remoteSocket && !remoteSocket.destroyed) remoteSocket.destroy();
     };
     ws.on('close', onEarlyDisconnect);
@@ -923,10 +997,12 @@ if (WebSocket) {
           if (pendingChunks.length > 0) {
             for (const b of pendingChunks) connectedSock.write(b);
             pendingChunks = [];
+            pendingChunksBytes = 0;
           }
           setupDuplexPipe(ws, connectedSock);
         }, () => {
           pendingChunks = [];
+          pendingChunksBytes = 0;
           ws.close();
         });
         remoteSocket = sock;
@@ -934,7 +1010,10 @@ if (WebSocket) {
         if (remoteSocket && !remoteSocket.destroyed && !remoteSocket.connecting) {
           remoteSocket.write(buffer);
         } else {
-          pendingChunks.push(buffer);
+          if (pendingChunksBytes + buffer.length <= MAX_PENDING_BYTES) {
+            pendingChunks.push(buffer);
+            pendingChunksBytes += buffer.length;
+          }
         }
       }
     });
@@ -944,10 +1023,13 @@ if (WebSocket) {
   wssTrojan.on('connection', (ws) => {
     let remoteSocket = null, isHeaderParsed = false, isWsClosed = false;
     let pendingChunks = [];
+    let pendingChunksBytes = 0;
+    const MAX_PENDING_BYTES = 1024 * 1024;
 
     const onEarlyDisconnect = () => {
       isWsClosed = true;
       pendingChunks = [];
+      pendingChunksBytes = 0;
       if (remoteSocket && !remoteSocket.destroyed) remoteSocket.destroy();
     };
     ws.on('close', onEarlyDisconnect);
@@ -969,10 +1051,12 @@ if (WebSocket) {
           if (pendingChunks.length > 0) {
             for (const b of pendingChunks) connectedSock.write(b);
             pendingChunks = [];
+            pendingChunksBytes = 0;
           }
           setupDuplexPipe(ws, connectedSock);
         }, () => {
           pendingChunks = [];
+          pendingChunksBytes = 0;
           ws.close();
         });
         remoteSocket = sock;
@@ -980,7 +1064,10 @@ if (WebSocket) {
         if (remoteSocket && !remoteSocket.destroyed && !remoteSocket.connecting) {
           remoteSocket.write(buffer);
         } else {
-          pendingChunks.push(buffer);
+          if (pendingChunksBytes + buffer.length <= MAX_PENDING_BYTES) {
+            pendingChunks.push(buffer);
+            pendingChunksBytes += buffer.length;
+          }
         }
       }
     });

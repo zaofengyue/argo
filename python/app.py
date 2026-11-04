@@ -49,7 +49,7 @@ if not UUID_REGEX.match(UUID):
     print(f"[FATAL] 核心 UUID 格式无效: \"{UUID}\"！必须为标准的 32 位十六进制 UUID（例如: 8fce614c-83b5-442b-928d-c78278f2e2cb）")
     sys.exit(1)
 PASSWORD        = (PRESET_PASSWORD       or os.environ.get('PASSWORD')        or os.environ.get('TROJAN_PASSWORD') or UUID).strip()
-LISTEN_HOST     = (os.environ.get('LISTEN_HOST') or os.environ.get('HOST') or '127.0.0.1').strip()
+LISTEN_HOST     = os.environ.get('LISTEN_HOST', '127.0.0.1').strip()
 HOST            = LISTEN_HOST
 PORT            = int(os.environ.get('PORT') or 3000)
 SUB_PATH        = (PRESET_SUB            or os.environ.get('SUB')             or 'sub').lstrip('/')
@@ -738,13 +738,13 @@ async def safe_open_connection(target_host: str, target_port: int):
         ip_obj = ipaddress.ip_address(h)
         if is_ip_blocked(ip_obj):
             return None, None
-        return await asyncio.open_connection(str(ip_obj), target_port)
+        return await asyncio.wait_for(asyncio.open_connection(str(ip_obj), target_port), timeout=10.0)
     except ValueError:
         pass
     except Exception:
         return None, None
 
-    # 域名 DNS 解析并按顺序尝试（安全过滤 + RFC 8305 Happy Eyeballs 双栈回退）
+    # 域名 DNS 解析并按顺序尝试（安全过滤 + RFC 8305 Happy Eyeballs 双栈回退，每地址 5s 超时）
     loop = asyncio.get_running_loop()
     try:
         infos = await loop.getaddrinfo(h, target_port, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
@@ -765,7 +765,7 @@ async def safe_open_connection(target_host: str, target_port: int):
 
     for sockaddr in safe_addrs:
         try:
-            return await asyncio.open_connection(sockaddr[0], sockaddr[1])
+            return await asyncio.wait_for(asyncio.open_connection(sockaddr[0], sockaddr[1]), timeout=5.0)
         except Exception:
             continue
 
@@ -774,6 +774,9 @@ async def safe_open_connection(target_host: str, target_port: int):
 # ── XHTTP (SplitHTTP) 会话多路复用连接池 (双层缓冲保护架构) ─────────────────
 MAX_XHTTP_SESSIONS = 5000
 xhttp_sessions: dict[str, dict] = {}
+UNAUTH_PER_SESSION_BYTES = 256 * 1024        # 单个未认证会话最多允许暂存 256KB 乱序包（防 seq1 抢先于 seq0）
+UNAUTH_GLOBAL_BYTES      = 16 * 1024 * 1024   # 全局所有未认证会话共享暂存上限 16MB（防 DoS 刷爆内存）
+unauth_uplink_bytes_global = 0
 
 def get_or_create_xhttp_session(session_id: str, protocol: str = 'vless'):
     if not session_id or not re.match(r'^[a-zA-Z0-9_-]{1,64}$', session_id):
@@ -799,6 +802,7 @@ def get_or_create_xhttp_session(session_id: str, protocol: str = 'vless'):
             'next_uplink_seq': 0,
             'pending_uplink_map': {},
             'pending_uplink_bytes': 0,
+            'unauth_buffered_bytes': 0,
             'is_parsed': False,
             'is_connected': False,
             'is_authenticated': False,
@@ -841,6 +845,10 @@ async def cleanup_xhttp_session(session_id: str):
     if not sess:
         return
     sess['closed'] = True
+    global unauth_uplink_bytes_global
+    if sess.get('unauth_buffered_bytes', 0) > 0:
+        unauth_uplink_bytes_global = max(0, unauth_uplink_bytes_global - sess['unauth_buffered_bytes'])
+        sess['unauth_buffered_bytes'] = 0
     if sess.get('r_writer'):
         try:
             sess['r_writer'].close()
@@ -856,6 +864,7 @@ async def cleanup_xhttp_session(session_id: str):
             t.cancel()
 
 async def dispatch_xhttp_uplink(sess: dict, data: bytes):
+    global unauth_uplink_bytes_global
     if sess['closed']:
         return
     if not sess['is_parsed']:
@@ -868,6 +877,9 @@ async def dispatch_xhttp_uplink(sess: dict, data: bytes):
             sess['is_parsed'] = True
             sess['is_authenticated'] = True
             sess['last_active'] = time.time()
+            if sess.get('unauth_buffered_bytes', 0) > 0:
+                unauth_uplink_bytes_global = max(0, unauth_uplink_bytes_global - sess['unauth_buffered_bytes'])
+                sess['unauth_buffered_bytes'] = 0
             r_reader, r_writer = await safe_open_connection(parsed['target_host'], parsed['target_port'])
             if not r_reader:
                 await cleanup_xhttp_session(sess['id'])
@@ -914,6 +926,7 @@ async def dispatch_xhttp_uplink(sess: dict, data: bytes):
             await sess['uplink_queue'].put(data)
 
 async def process_xhttp_uplink(sess: dict, data: bytes, seq: int = None):
+    global unauth_uplink_bytes_global
     if sess['closed']:
         return
     if sess.get('is_authenticated'):
@@ -929,17 +942,30 @@ async def process_xhttp_uplink(sess: dict, data: bytes, seq: int = None):
 
         while sess['next_uplink_seq'] in sess['pending_uplink_map']:
             next_data = sess['pending_uplink_map'].pop(sess['next_uplink_seq'])
-            sess['pending_uplink_bytes'] = max(0, sess.get('pending_uplink_bytes', 0) - len(next_data))
+            data_len = len(next_data)
+            sess['pending_uplink_bytes'] = max(0, sess.get('pending_uplink_bytes', 0) - data_len)
+            if not sess.get('is_authenticated') and sess.get('unauth_buffered_bytes', 0) > 0:
+                dec = min(sess['unauth_buffered_bytes'], data_len)
+                sess['unauth_buffered_bytes'] -= dec
+                unauth_uplink_bytes_global = max(0, unauth_uplink_bytes_global - dec)
             await dispatch_xhttp_uplink(sess, next_data)
             sess['next_uplink_seq'] += 1
     elif seq > sess['next_uplink_seq']:
-        # 未认证会话绝不允许乱序缓冲（防恶意填充内存）
+        data_len = len(data)
         if not sess.get('is_authenticated'):
-            return
-        # 已认证会话最多允许缓冲 4MB
-        if sess.get('pending_uplink_bytes', 0) + len(data) <= 4 * 1024 * 1024:
-            sess['pending_uplink_map'][seq] = data
-            sess['pending_uplink_bytes'] = sess.get('pending_uplink_bytes', 0) + len(data)
+            # 未认证会话允许小额乱序缓冲（单会话 256KB，全局 16MB，15s 超时未认证自动释放）
+            if (sess.get('unauth_buffered_bytes', 0) + data_len > UNAUTH_PER_SESSION_BYTES or
+                unauth_uplink_bytes_global + data_len > UNAUTH_GLOBAL_BYTES):
+                return
+            sess['unauth_buffered_bytes'] = sess.get('unauth_buffered_bytes', 0) + data_len
+            unauth_uplink_bytes_global += data_len
+        else:
+            # 已认证会话最多允许缓冲 4MB
+            if sess.get('pending_uplink_bytes', 0) + data_len > 4 * 1024 * 1024:
+                return
+
+        sess['pending_uplink_map'][seq] = data
+        sess['pending_uplink_bytes'] = sess.get('pending_uplink_bytes', 0) + data_len
 
 @routes.get(f"{PATH_XHTTP}/{{session_id}}")
 async def handle_vless_xhttp_get(request):
