@@ -1410,7 +1410,7 @@ async function startArgoTunnel(localPort) {
   };
 
   if (ARGO_DOMAIN && ARGO_AUTH) {
-    console.log(`[Argo] 正在建立固定隧道: ${ARGO_DOMAIN}`);
+    console.log(`[Argo] 正在建立固定隧道: ${ARGO_DOMAIN} (协议: ${ARGO_PROTOCOL || 'auto'})`);
     args.push('run');
     CURRENT_ARGO_HOST = ARGO_DOMAIN;
     const cfEnv = { ...process.env, TUNNEL_TOKEN: ARGO_AUTH };
@@ -1445,7 +1445,7 @@ async function startArgoTunnel(localPort) {
       notifyTelegram(CURRENT_ARGO_HOST);
     }, 3000);
   } else {
-    console.log('[Argo] 正在向 Cloudflare 申请临时穿透域名...');
+    console.log(`[Argo] 正在向 Cloudflare 申请临时穿透域名... (协议: ${ARGO_PROTOCOL || 'auto'})`);
     args.push('--url', `http://127.0.0.1:${localPort}`);
 
     superviseProcess('Argo临时隧道', () => {

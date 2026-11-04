@@ -594,7 +594,7 @@ async def start_argo_tunnel(local_port: int):
         args.extend(['--protocol', ARGO_PROTOCOL])
 
     if ARGO_DOMAIN and ARGO_AUTH:
-        print(f"[Argo] 正在建立固定隧道: {ARGO_DOMAIN}")
+        print(f"[Argo] 正在建立固定隧道: {ARGO_DOMAIN} (协议: {ARGO_PROTOCOL or 'auto'})")
         fixed_args = list(args) + ['run']
         CURRENT_ARGO_HOST = ARGO_DOMAIN
         env = os.environ.copy()
@@ -633,7 +633,7 @@ async def start_argo_tunnel(local_port: int):
         display_node_info(CURRENT_ARGO_HOST)
         await notify_telegram(CURRENT_ARGO_HOST)
     else:
-        print("[Argo] 正在向 Cloudflare 申请临时穿透域名...")
+        print(f"[Argo] 正在向 Cloudflare 申请临时穿透域名... (协议: {ARGO_PROTOCOL or 'auto'})")
         temp_args = list(args) + ['--url', f"http://127.0.0.1:{local_port}"]
 
         async def spawn_temp():

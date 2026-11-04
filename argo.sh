@@ -604,6 +604,9 @@ quick_install_wizard() {
     local cur_argo_auth="${ARGO_AUTH:-$(get_env "ARGO_AUTH")}"
     set_env "ARGO_AUTH" "$cur_argo_auth"
 
+    local cur_argo_proto="${ARGO_PROTOCOL:-$(get_env "ARGO_PROTOCOL")}"
+    set_env "ARGO_PROTOCOL" "$cur_argo_proto"
+
     local cur_cf="${CF_PREFER_HOST:-$(get_env "CF_PREFER_HOST")}"
     [[ -z "$cur_cf" ]] && cur_cf="www.visa.com.tw"
     set_env "CF_PREFER_HOST" "$cur_cf"
@@ -733,6 +736,9 @@ config_menu() {
         local cur_km="未配置"
         [[ -n "$cur_km_domain" && -n "$cur_km_token" ]] && cur_km="已配置 (${cur_km_domain})"
 
+        local cur_proto=$(get_env "ARGO_PROTOCOL")
+        [[ -z "$cur_proto" ]] && cur_proto="auto (自动)"
+
         cur_bbr=$(get_bbr_status)
 
         echo -e "${CYAN}====================================================${NC}"
@@ -745,12 +751,13 @@ config_menu() {
         echo -e " ${GREEN}5.${NC} Argo 固定域名  : ${CYAN}${cur_domain}${NC}"
         echo -e " ${GREEN}6.${NC} Argo 隧道凭证  : ${CYAN}${cur_auth}${NC}"
         echo -e " ${GREEN}7.${NC} CF 优选域名    : ${CYAN}${cur_cf}${NC}"
-        echo -e " ${GREEN}8.${NC} Komari 探针    : ${CYAN}${cur_km}${NC}"
-        echo -e " ${GREEN}9.${NC} TCP BBR 加速   : ${CYAN}${cur_bbr}${NC}"
+        echo -e " ${GREEN}8.${NC} Argo 隧道协议  : ${CYAN}${cur_proto}${NC}"
+        echo -e " ${GREEN}9.${NC} Komari 探针    : ${CYAN}${cur_km}${NC}"
+        echo -e " ${GREEN}10.${NC} TCP BBR 加速  : ${CYAN}${cur_bbr}${NC}"
         echo -e "${CYAN}----------------------------------------------------${NC}"
         echo -e " ${WHITE}0.${NC} 返回主菜单"
         echo -e "${CYAN}====================================================${NC}"
-        read -rp "请输入要修改的配置项 [0-9]: " cfg_choice
+        read -rp "请输入要修改的配置项 [0-10]: " cfg_choice
 
         case "$cfg_choice" in
             1)
@@ -835,6 +842,21 @@ config_menu() {
                 fi
                 ;;
             8)
+                echo -e "\n当前 Argo 隧道协议: ${GREEN}${cur_proto}${NC}"
+                echo -e "可选值: ${CYAN}quic${NC} (基于 UDP，抗丢包高并发) / ${CYAN}http2${NC} (基于 TCP) / ${CYAN}auto${NC} (由 cloudflared 自动协商)"
+                read -rp "请输入新的协议 (输入 'quic' / 'http2' / 'auto'，留空保持原值): " new_val
+                if [[ "$new_val" == "auto" || "$new_val" == "none" ]]; then
+                    set_env "ARGO_PROTOCOL" ""
+                    modified=1
+                elif [[ "$new_val" == "quic" || "$new_val" == "http2" ]]; then
+                    set_env "ARGO_PROTOCOL" "$new_val"
+                    modified=1
+                elif [[ -n "$new_val" ]]; then
+                    log_warn "无效协议，仅支持 'quic'、'http2' 或 'auto'！"
+                    sleep 1.5
+                fi
+                ;;
+            9)
                 echo -e "\n当前 Komari 探针: ${GREEN}${cur_km}${NC}"
                 read -rp "请输入 Komari 服务端域名 (输入 'none' 关闭探针，留空保持原值): " new_domain
                 if [[ "$new_domain" == "none" ]]; then
@@ -848,7 +870,7 @@ config_menu() {
                     modified=1
                 fi
                 ;;
-            9)
+            10)
                 manage_bbr
                 ;;
             0)
