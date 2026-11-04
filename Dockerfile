@@ -7,9 +7,9 @@ WORKDIR /app
 # 1. 安装基础工具与兼容运行库（保证 Alpine 下 Go 静态/动态二进制兼容及 PID 1 信号管理）
 RUN apk add --no-cache curl bash ca-certificates procps gcompat libc6-compat tini
 
-# 2. 预置多架构穿透与监控工具（秒级冷启动，避免运行时临时下载失败）
+# 2. 预置多架构穿透与监控工具（秒级冷启动，支持非 root 容器环境权限）
 RUN set -eux; \
-    mkdir -p /root/.argo-core /root/.cache/node-core /usr/local/bin; \
+    mkdir -p /opt/argo-core /root/.argo-core /root/.cache/node-core /usr/local/bin; \
     case "${TARGETARCH}" in \
       amd64) \
         CF_ARCH="linux-amd64"; KM_ARCH="linux-amd64" ;; \
@@ -18,15 +18,18 @@ RUN set -eux; \
       *) \
         CF_ARCH="linux-amd64"; KM_ARCH="linux-amd64" ;; \
     esac; \
-    # 下载 cloudflared 穿透核心并放置到核心目录
-    curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${CF_ARCH}" -o /root/.argo-core/bridge; \
-    chmod +x /root/.argo-core/bridge; \
-    # 下载 komari-agent 探针并放置到核心目录
-    curl -fsSL "https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-${KM_ARCH}" -o /root/.argo-core/metrics; \
-    chmod +x /root/.argo-core/metrics; \
-    # 软链接兼容
-    ln -sf /root/.argo-core/bridge /usr/local/bin/cloudflared; \
-    ln -sf /root/.argo-core/metrics /usr/local/bin/komari-agent
+    # 下载 cloudflared 穿透核心并放置到 /opt/argo-core 目录
+    curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${CF_ARCH}" -o /opt/argo-core/bridge; \
+    chmod 755 /opt/argo-core/bridge; \
+    # 下载 komari-agent 探针并放置到 /opt/argo-core 目录
+    curl -fsSL "https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-${KM_ARCH}" -o /opt/argo-core/metrics; \
+    chmod 755 /opt/argo-core/metrics; \
+    # 软链接兼容 /root/.argo-core 与系统 PATH (/usr/local/bin)
+    ln -sf /opt/argo-core/bridge /root/.argo-core/bridge; \
+    ln -sf /opt/argo-core/metrics /root/.argo-core/metrics; \
+    ln -sf /opt/argo-core/bridge /usr/local/bin/cloudflared; \
+    ln -sf /opt/argo-core/metrics /usr/local/bin/komari-agent; \
+    chmod -R 755 /opt/argo-core /usr/local/bin
 
 # 3. 安装依赖与复制代码
 COPY nodejs/package.json ./

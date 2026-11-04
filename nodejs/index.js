@@ -196,8 +196,21 @@ async function resolveNodeName() {
 const nodeNamePromise = resolveNodeName();
 
 // ── 容器在线时长虚拟化（对标当前容器启动时刻，解决探针显示几百天问题）───────
+function isContainerEnvironment() {
+  if (os.platform() !== 'linux') return false;
+  try {
+    if (fs.existsSync('/.dockerenv') || fs.existsSync('/run/.containerenv')) return true;
+    if (fs.existsSync('/proc/1/cgroup')) {
+      const cgroup = fs.readFileSync('/proc/1/cgroup', 'utf8');
+      return /docker|kubepods|containerd|lxc/i.test(cgroup);
+    }
+  } catch {}
+  return false;
+}
+
 function setupContainerUptime() {
-  if (os.platform() !== 'linux' || uptimeTimer) return;
+  // 必须仅在真实容器环境下生效，严禁在 VPS 宿主机上篡改母机 /proc/uptime
+  if (!isContainerEnvironment() || uptimeTimer) return;
   const fakeFile = '/tmp/.fake_uptime';
   const startTime = Math.floor(Date.now() / 1000);
   try {
@@ -417,6 +430,8 @@ function resolveAndConnect(targetHost, targetPort, onConnected, onError) {
     : { host: h, port: targetPort, lookup: safeDnsLookup, autoSelectFamily: true };
 
   const socket = net.connect(connectOpts);
+  socket.setKeepAlive(true, 15000); // 开启系统级 TCP 心跳保活，防止 Cloudflare 100s 空闲切断
+  socket.setNoDelay(true);          // 禁用 Nagle 算法，降低代理端到端传输延迟
 
   // 10 秒连接超时门禁，防止远端黑洞无限挂起
   const connTimer = setTimeout(() => {
@@ -547,6 +562,12 @@ function dispatchUplinkData(session, data) {
       session.timer = setTimeout(() => cleanupXhttpSession(session.id), 60000); // 切换为正常 60s 闲置超时
 
       resolveAndConnect(parsed.targetHost, parsed.targetPort, (remoteSocket) => {
+        // 会话有效性门禁：若建连期间客户端断开导致会话已被清理，立即安全销毁 Socket 防止孤儿连接泄漏
+        if (!xhttpSessions.has(session.id)) {
+          remoteSocket.on('error', () => {});
+          remoteSocket.destroy();
+          return;
+        }
         session.isConnected = true;
         if (session.protocol === 'vless' && session.downlinkRes && !session.handshakeSent) {
           session.downlinkRes.write(Buffer.from([0, 0]));
@@ -754,6 +775,13 @@ const server = http.createServer((req, res) => {
         let isEnded = false;
         const chunksQueue = [];
 
+        res.on('close', () => {
+          if (remoteSocket && !remoteSocket.destroyed) {
+            remoteSocket.on('error', () => {});
+            remoteSocket.destroy();
+          }
+        });
+
         req.on('data', (chunk) => {
           if (!isParsed) {
             chunksQueue.push(chunk);
@@ -770,6 +798,11 @@ const server = http.createServer((req, res) => {
             if (parsed) {
               isParsed = true;
               const sock = resolveAndConnect(parsed.targetHost, parsed.targetPort, (connectedSock) => {
+                if (res.destroyed || res.writableEnded) {
+                  connectedSock.on('error', () => {});
+                  connectedSock.destroy();
+                  return;
+                }
                 res.writeHead(200, {
                   'Content-Type': 'application/octet-stream',
                   'Transfer-Encoding': 'chunked',
@@ -810,7 +843,10 @@ const server = http.createServer((req, res) => {
             }
           } else {
             if (remoteSocket && !remoteSocket.destroyed && !remoteSocket.connecting) {
-              remoteSocket.write(chunk);
+              if (!remoteSocket.write(chunk)) {
+                req.pause();
+                remoteSocket.once('drain', () => req.resume());
+              }
             } else {
               if (pendingChunksBytes + chunk.length <= MAX_PENDING_BYTES) {
                 pendingChunks.push(chunk);
@@ -859,6 +895,13 @@ const server = http.createServer((req, res) => {
         let isEnded = false;
         const chunksQueue = [];
 
+        res.on('close', () => {
+          if (remoteSocket && !remoteSocket.destroyed) {
+            remoteSocket.on('error', () => {});
+            remoteSocket.destroy();
+          }
+        });
+
         req.on('data', (chunk) => {
           if (!isParsed) {
             chunksQueue.push(chunk);
@@ -875,6 +918,11 @@ const server = http.createServer((req, res) => {
             if (parsed) {
               isParsed = true;
               const sock = resolveAndConnect(parsed.targetHost, parsed.targetPort, (connectedSock) => {
+                if (res.destroyed || res.writableEnded) {
+                  connectedSock.on('error', () => {});
+                  connectedSock.destroy();
+                  return;
+                }
                 res.writeHead(200, {
                   'Content-Type': 'application/octet-stream',
                   'Transfer-Encoding': 'chunked',
@@ -914,7 +962,10 @@ const server = http.createServer((req, res) => {
             }
           } else {
             if (remoteSocket && !remoteSocket.destroyed && !remoteSocket.connecting) {
-              remoteSocket.write(chunk);
+              if (!remoteSocket.write(chunk)) {
+                req.pause();
+                remoteSocket.once('drain', () => req.resume());
+              }
             } else {
               if (pendingChunksBytes + chunk.length <= MAX_PENDING_BYTES) {
                 pendingChunks.push(chunk);
@@ -1008,6 +1059,7 @@ if (WebSocket) {
         isHeaderParsed = true;
         const sock = resolveAndConnect(parsed.targetHost, parsed.targetPort, (connectedSock) => {
           if (isWsClosed || ws.readyState !== WebSocket.OPEN) {
+            connectedSock.on('error', () => {});
             connectedSock.destroy();
             return;
           }
@@ -1027,7 +1079,15 @@ if (WebSocket) {
         remoteSocket = sock;
       } else {
         if (remoteSocket && !remoteSocket.destroyed && !remoteSocket.connecting) {
-          remoteSocket.write(buffer);
+          const canWrite = remoteSocket.write(buffer);
+          if (!canWrite && ws._socket && !ws._socket.destroyed) {
+            ws._socket.pause();
+            remoteSocket.once('drain', () => {
+              if (ws._socket && !ws._socket.destroyed) {
+                ws._socket.resume();
+              }
+            });
+          }
         } else {
           if (pendingChunksBytes + buffer.length <= MAX_PENDING_BYTES) {
             pendingChunks.push(buffer);
@@ -1068,6 +1128,7 @@ if (WebSocket) {
         isHeaderParsed = true;
         const sock = resolveAndConnect(parsed.targetHost, parsed.targetPort, (connectedSock) => {
           if (isWsClosed || ws.readyState !== WebSocket.OPEN) {
+            connectedSock.on('error', () => {});
             connectedSock.destroy();
             return;
           }
@@ -1086,7 +1147,15 @@ if (WebSocket) {
         remoteSocket = sock;
       } else {
         if (remoteSocket && !remoteSocket.destroyed && !remoteSocket.connecting) {
-          remoteSocket.write(buffer);
+          const canWrite = remoteSocket.write(buffer);
+          if (!canWrite && ws._socket && !ws._socket.destroyed) {
+            ws._socket.pause();
+            remoteSocket.once('drain', () => {
+              if (ws._socket && !ws._socket.destroyed) {
+                ws._socket.resume();
+              }
+            });
+          }
         } else {
           if (pendingChunksBytes + buffer.length <= MAX_PENDING_BYTES) {
             pendingChunks.push(buffer);
@@ -1199,15 +1268,6 @@ let subCleanScheduled = false;
 function scheduleSubFileCleanup(delaySec) {
   if (subCleanScheduled || !fs.existsSync(SUB_FILE)) return;
   subCleanScheduled = true;
-  if (os.platform() !== 'win32') {
-    try {
-      spawn('sh', ['-c', `sleep ${delaySec} && rm -f ${JSON.stringify(SUB_FILE)}`], {
-        detached: true,
-        stdio: 'ignore'
-      }).unref();
-      return;
-    } catch {}
-  }
   setTimeout(() => {
     try { if (fs.existsSync(SUB_FILE)) fs.unlinkSync(SUB_FILE); } catch {}
   }, delaySec * 1000).unref();
@@ -1275,28 +1335,77 @@ function displayNodeInfo(host) {
   }
 }
 
-// ── 5. 通用下载工具（带 302 重定向跟随）───────────────────────────────────────
-function downloadBinary(url, dest) {
+// ── 5. 通用下载工具（带 302 重定向跟随、超时及协议安全适配）──────────────
+function downloadBinary(url, dest, maxRedirects = 5, timeoutMs = 15000) {
   return new Promise((resolve, reject) => {
-    const handleReq = (currUrl) => {
-      https.get(currUrl, (res) => {
+    let timer = null;
+    let fileStream = null;
+
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      if (fileStream) {
+        try { fileStream.destroy(); } catch {}
+        try { if (fs.existsSync(dest)) fs.unlinkSync(dest); } catch {}
+      }
+    };
+
+    const handleReq = (currUrl, redirectsLeft) => {
+      if (redirectsLeft < 0) {
+        cleanup();
+        return reject(new Error('Too many redirects'));
+      }
+      let parsedUrl;
+      try {
+        parsedUrl = new URL(currUrl);
+      } catch (e) {
+        cleanup();
+        return reject(e);
+      }
+      const client = parsedUrl.protocol === 'http:' ? http : https;
+
+      const req = client.get(currUrl, { timeout: timeoutMs }, (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          return handleReq(res.headers.location);
+          const nextUrl = new URL(res.headers.location, currUrl).href;
+          res.resume();
+          return handleReq(nextUrl, redirectsLeft - 1);
         }
         if (res.statusCode !== 200) {
+          res.resume();
+          cleanup();
           return reject(new Error(`HTTP ${res.statusCode}`));
         }
-        const fileStream = fs.createWriteStream(dest);
+        fileStream = fs.createWriteStream(dest);
         res.pipe(fileStream);
         fileStream.on('finish', () => {
           fileStream.close(() => {
+            if (timer) clearTimeout(timer);
             try { fs.chmodSync(dest, 0o755); } catch {}
             resolve(dest);
           });
         });
-      }).on('error', reject);
+        fileStream.on('error', (err) => {
+          cleanup();
+          reject(err);
+        });
+      });
+
+      req.on('error', (err) => {
+        cleanup();
+        reject(err);
+      });
+      req.on('timeout', () => {
+        req.destroy();
+        cleanup();
+        reject(new Error(`Download timeout (${timeoutMs}ms)`));
+      });
     };
-    handleReq(url);
+
+    timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`Download timeout (${timeoutMs}ms)`));
+    }, timeoutMs);
+
+    handleReq(url, maxRedirects);
   });
 }
 
@@ -1328,6 +1437,7 @@ function verifyBinary(binPath, flag) {
 async function ensureCloudflared() {
   const candidates = [
     CF_BIN_PATH,
+    '/opt/argo-core/bridge',
     'cloudflared',
     '/usr/local/bin/cloudflared',
     '/usr/bin/cloudflared',
@@ -1365,6 +1475,7 @@ async function ensureKomariAgent() {
   if (!KOMARI_DOMAIN || !KOMARI_TOKEN) return null;
   const candidates = [
     KM_BIN_PATH,
+    '/opt/argo-core/metrics',
     'komari-agent',
     '/usr/local/bin/komari-agent',
     '/root/.cache/node-core/node-metrics'

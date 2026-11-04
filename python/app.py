@@ -84,6 +84,12 @@ tracked_processes = []
 is_shutting_down = False
 CURRENT_ARGO_HOST = ARGO_DOMAIN or 'your-domain.com'
 node_name_task = None
+background_tasks = set()
+
+def track_task(task: asyncio.Task) -> asyncio.Task:
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+    return task
 
 HOME_DIR = Path.home()
 CORE_DIR = HOME_DIR / '.argo-core'
@@ -207,8 +213,23 @@ async def resolve_node_name() -> str:
     return NODE_NAME
 
 # ── 容器在线时长虚拟化（对标当前容器启动时刻，解决探针显示几百天问题）───────
-async def setup_container_uptime():
+def is_container_environment() -> bool:
     if platform.system().lower() != 'linux':
+        return False
+    try:
+        if Path('/.dockerenv').exists() or Path('/run/.containerenv').exists():
+            return True
+        cgroup_path = Path('/proc/1/cgroup')
+        if cgroup_path.exists():
+            cgroup = cgroup_path.read_text('utf-8', errors='ignore')
+            return bool(re.search(r'docker|kubepods|containerd|lxc', cgroup, re.I))
+    except Exception:
+        pass
+    return False
+
+async def setup_container_uptime():
+    # 必须仅在真实容器环境下生效，严禁在 VPS 宿主机上篡改母机 /proc/uptime
+    if not is_container_environment():
         return
     fake_file = Path('/tmp/.fake_uptime')
     start_time = int(time.time())
@@ -432,7 +453,7 @@ def schedule_sub_cleanup(delay_sec: int):
             pass
 
     try:
-        asyncio.create_task(cleanup())
+        track_task(asyncio.create_task(cleanup()))
     except RuntimeError:
         pass
 
@@ -475,7 +496,7 @@ def display_node_info(host: str):
                 print(f"若需获取订阅链接，可访问订阅路径: {sub_url}")
                 print("====================================================")
             try:
-                asyncio.create_task(clear_task())
+                track_task(asyncio.create_task(clear_task()))
             except RuntimeError:
                 pass
     else:
@@ -525,6 +546,7 @@ async def download_binary(url: str, dest: Path) -> Path:
 async def ensure_cloudflared() -> Path | None:
     candidates = [
         CF_BIN_PATH,
+        Path('/opt/argo-core/bridge'),
         Path('cloudflared'),
         Path('/usr/local/bin/cloudflared'),
         Path('/usr/bin/cloudflared')
@@ -556,6 +578,7 @@ async def ensure_komari_agent() -> Path | None:
         return None
     candidates = [
         KM_BIN_PATH,
+        Path('/opt/argo-core/metrics'),
         Path('komari-agent'),
         Path('/usr/local/bin/komari-agent'),
         Path.home() / '.cache/node-core/node-metrics'
@@ -659,10 +682,10 @@ async def start_argo_tunnel(local_port: int):
                     elif not re.search(r'(\bINF\b|hard_fail=false)', line_str, re.I) and re.search(r'(ERR|error|\bfail(ed|ure)?\b|refused|unable|panic|fatal)', line_str, re.I):
                         print(f"[Argo固定隧道异常] {line_str}", file=sys.stderr)
 
-            asyncio.create_task(monitor_fixed_stderr())
+            track_task(asyncio.create_task(monitor_fixed_stderr()))
             return proc
 
-        asyncio.create_task(supervise_process('Argo固定隧道', spawn_fixed))
+        track_task(asyncio.create_task(supervise_process('Argo固定隧道', spawn_fixed)))
     else:
         print(f"[Argo] 正在向 Cloudflare 申请临时穿透域名... (协议: {ARGO_PROTOCOL or 'auto'})")
         temp_args = list(args) + ['--url', f"http://127.0.0.1:{local_port}"]
@@ -699,10 +722,10 @@ async def start_argo_tunnel(local_port: int):
                     elif not re.search(r'(\bINF\b|hard_fail=false)', line_str, re.I) and re.search(r'(ERR|error|\bfail(ed|ure)?\b|refused|unable|panic|fatal)', line_str, re.I):
                         print(f"[Argo临时隧道异常] {line_str}", file=sys.stderr)
 
-            asyncio.create_task(monitor_stderr())
+            track_task(asyncio.create_task(monitor_stderr()))
             return proc
 
-        asyncio.create_task(supervise_process('Argo临时隧道', spawn_temp))
+        track_task(asyncio.create_task(supervise_process('Argo临时隧道', spawn_temp)))
 
 # ── 启动 Komari 监控探针（异步进程守护保活）──────────────────────────────────
 async def start_komari():
@@ -712,7 +735,7 @@ async def start_komari():
     if not km_bin:
         return
 
-    asyncio.create_task(setup_container_uptime())
+    track_task(asyncio.create_task(setup_container_uptime()))
     endpoint = KOMARI_DOMAIN.strip()
     if not endpoint.startswith(('http://', 'https://')):
         endpoint = f"https://{endpoint}"
@@ -732,7 +755,7 @@ async def start_komari():
             env=env
         )
 
-    asyncio.create_task(supervise_process('Komari监控探针', spawn_km))
+    track_task(asyncio.create_task(supervise_process('Komari监控探针', spawn_km)))
 
 # ── 路由与全双工转发引擎 ───────────────────────────────────────────────────
 routes = web.RouteTableDef()
@@ -792,6 +815,17 @@ def is_ip_blocked(ip_obj) -> bool:
             return True
     return False
 
+def configure_socket_keepalive(writer):
+    if not writer:
+        return
+    try:
+        sock = writer.get_extra_info('socket')
+        if sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
+
 async def safe_open_connection(target_host: str, target_port: int):
     if not target_host:
         return None, None
@@ -804,7 +838,9 @@ async def safe_open_connection(target_host: str, target_port: int):
         ip_obj = ipaddress.ip_address(h)
         if is_ip_blocked(ip_obj):
             return None, None
-        return await asyncio.wait_for(asyncio.open_connection(str(ip_obj), target_port), timeout=10.0)
+        r_reader, r_writer = await asyncio.wait_for(asyncio.open_connection(str(ip_obj), target_port), timeout=10.0)
+        configure_socket_keepalive(r_writer)
+        return r_reader, r_writer
     except ValueError:
         pass
     except Exception:
@@ -831,7 +867,9 @@ async def safe_open_connection(target_host: str, target_port: int):
 
     for sockaddr in safe_addrs:
         try:
-            return await asyncio.wait_for(asyncio.open_connection(sockaddr[0], sockaddr[1]), timeout=5.0)
+            r_reader, r_writer = await asyncio.wait_for(asyncio.open_connection(sockaddr[0], sockaddr[1]), timeout=5.0)
+            configure_socket_keepalive(r_writer)
+            return r_reader, r_writer
         except Exception:
             continue
 
@@ -857,14 +895,14 @@ def get_or_create_xhttp_session(session_id: str, protocol: str = 'vless'):
                     break
             if not evicted_id:
                 evicted_id = next(iter(xhttp_sessions))
-            asyncio.create_task(cleanup_xhttp_session(evicted_id))
+            track_task(asyncio.create_task(cleanup_xhttp_session(evicted_id)))
         sess = {
             'id': session_id,
             'protocol': protocol,
             'r_reader': None,
             'r_writer': None,
-            'downlink_queue': asyncio.Queue(),
-            'uplink_queue': asyncio.Queue(),
+            'downlink_queue': asyncio.Queue(maxsize=128),
+            'uplink_queue': asyncio.Queue(maxsize=128),
             'next_uplink_seq': 0,
             'pending_uplink_map': {},
             'pending_uplink_bytes': 0,
@@ -1161,12 +1199,6 @@ async def handle_xhttp(request):
                 await r_writer.drain()
         except Exception:
             pass
-        finally:
-            try:
-                r_writer.close()
-                await r_writer.wait_closed()
-            except Exception:
-                pass
 
     async def pipe_remote_to_resp():
         try:
@@ -1178,7 +1210,18 @@ async def handle_xhttp(request):
         except Exception:
             pass
 
-    await asyncio.gather(pipe_req_to_remote(), pipe_remote_to_resp())
+    t1 = asyncio.create_task(pipe_req_to_remote())
+    t2 = asyncio.create_task(pipe_remote_to_resp())
+    try:
+        done, pending = await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
+        for p in pending:
+            p.cancel()
+    finally:
+        try:
+            r_writer.close()
+            await r_writer.wait_closed()
+        except Exception:
+            pass
     return resp
 
 @routes.post(PATH_TROJAN_XHTTP)
@@ -1218,12 +1261,6 @@ async def handle_trojan_xhttp(request):
                 await r_writer.drain()
         except Exception:
             pass
-        finally:
-            try:
-                r_writer.close()
-                await r_writer.wait_closed()
-            except Exception:
-                pass
 
     async def pipe_remote_to_resp():
         try:
@@ -1235,7 +1272,18 @@ async def handle_trojan_xhttp(request):
         except Exception:
             pass
 
-    await asyncio.gather(pipe_req_to_remote(), pipe_remote_to_resp())
+    t1 = asyncio.create_task(pipe_req_to_remote())
+    t2 = asyncio.create_task(pipe_remote_to_resp())
+    try:
+        done, pending = await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
+        for p in pending:
+            p.cancel()
+    finally:
+        try:
+            r_writer.close()
+            await r_writer.wait_closed()
+        except Exception:
+            pass
     return resp
 
 @routes.get(PATH_VLESS)
@@ -1274,7 +1322,7 @@ async def handle_vless_ws(request):
                         finally:
                             await ws.close()
 
-                    asyncio.create_task(pipe_remote_to_ws())
+                    track_task(asyncio.create_task(pipe_remote_to_ws()))
                 else:
                     r_writer.write(data)
                     await r_writer.drain()
@@ -1324,7 +1372,7 @@ async def handle_trojan_ws(request):
                         finally:
                             await ws.close()
 
-                    asyncio.create_task(pipe_remote_to_ws())
+                    track_task(asyncio.create_task(pipe_remote_to_ws()))
                 else:
                     r_writer.write(data)
                     await r_writer.drain()
@@ -1358,9 +1406,9 @@ async def on_startup(app):
     print(f"🔒 独立密码: {PASSWORD}")
     print("====================================================")
 
-    asyncio.create_task(xhttp_session_sweeper())
-    asyncio.create_task(start_argo_tunnel(PORT))
-    asyncio.create_task(start_komari())
+    track_task(asyncio.create_task(xhttp_session_sweeper()))
+    track_task(asyncio.create_task(start_argo_tunnel(PORT)))
+    track_task(asyncio.create_task(start_komari()))
 
 async def on_cleanup(app):
     global is_shutting_down
