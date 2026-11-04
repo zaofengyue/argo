@@ -297,12 +297,179 @@ function parseTrojanHeader(buffer) {
 // ── 节点链接生成器（原生高能 4 组合，名称仅 国家+运营商）───────────────────
 function generateNodeLinks(host, preferHost) {
   const remark = encodeURIComponent(NODE_NAME || 'argo');
-  const vlessXhttp  = `vless://${UUID}@${preferHost}:443?encryption=none&security=tls&type=xhttp&host=${host}&path=${encodeURIComponent(PATH_XHTTP)}&sni=${host}#${remark}`;
+  const vlessXhttp  = `vless://${UUID}@${preferHost}:443?encryption=none&security=tls&type=xhttp&host=${host}&path=${encodeURIComponent(PATH_XHTTP)}&mode=packet-up&sni=${host}#${remark}`;
   const vlessWs     = `vless://${UUID}@${preferHost}:443?encryption=none&security=tls&type=ws&host=${host}&path=${encodeURIComponent(PATH_VLESS)}&sni=${host}#${remark}`;
-  const trojanXhttp = `trojan://${PASSWORD}@${preferHost}:443?security=tls&type=xhttp&host=${host}&path=${encodeURIComponent(PATH_TROJAN_XHTTP)}&sni=${host}#${remark}`;
+  const trojanXhttp = `trojan://${PASSWORD}@${preferHost}:443?security=tls&type=xhttp&host=${host}&path=${encodeURIComponent(PATH_TROJAN_XHTTP)}&mode=packet-up&sni=${host}#${remark}`;
   const trojanWs    = `trojan://${PASSWORD}@${preferHost}:443?security=tls&type=ws&host=${host}&path=${encodeURIComponent(PATH_TROJAN)}&sni=${host}#${remark}`;
 
   return [vlessXhttp, vlessWs, trojanXhttp, trojanWs];
+}
+
+// ── XHTTP (SplitHTTP) 会话多路复用连接池 (packet-up / packet-down 架构) ─────
+const xhttpSessions = new Map();
+
+function cleanupXhttpSession(sessionId) {
+  const session = xhttpSessions.get(sessionId);
+  if (!session) return;
+  if (session.timer) clearTimeout(session.timer);
+  if (session.remoteSocket && !session.remoteSocket.destroyed) {
+    session.remoteSocket.destroy();
+  }
+  if (session.downlinkRes && !session.downlinkRes.writableEnded) {
+    session.downlinkRes.end();
+  }
+  xhttpSessions.delete(sessionId);
+}
+
+function refreshSessionTimer(session) {
+  if (session.timer) clearTimeout(session.timer);
+  session.timer = setTimeout(() => cleanupXhttpSession(session.id), 60000);
+}
+
+function getOrCreateXhttpSession(sessionId, protocol = 'vless') {
+  let session = xhttpSessions.get(sessionId);
+  if (!session) {
+    session = {
+      id: sessionId,
+      protocol,
+      remoteSocket: null,
+      downlinkRes: null,
+      uplinkQueue: [],
+      downlinkQueue: [],
+      isParsed: false,
+      isConnected: false,
+      handshakeSent: false,
+      headerBuf: Buffer.alloc(0),
+      createdAt: Date.now(),
+      timer: null
+    };
+    refreshSessionTimer(session);
+    xhttpSessions.set(sessionId, session);
+  }
+  return session;
+}
+
+function processXhttpUplinkData(session, data) {
+  refreshSessionTimer(session);
+  if (!session.isParsed) {
+    session.headerBuf = Buffer.concat([session.headerBuf, data]);
+    if (session.headerBuf.length > 2048) {
+      cleanupXhttpSession(session.id);
+      return;
+    }
+    const parsed = session.protocol === 'vless'
+      ? parseVlessHeader(session.headerBuf)
+      : parseTrojanHeader(session.headerBuf);
+
+    if (parsed) {
+      session.isParsed = true;
+      const remoteSocket = net.connect({ host: parsed.targetHost, port: parsed.targetPort }, () => {
+        session.isConnected = true;
+        if (session.protocol === 'vless' && session.downlinkRes && !session.handshakeSent) {
+          session.downlinkRes.write(Buffer.from([0, 0]));
+          session.handshakeSent = true;
+        }
+        if (parsed.payload.length > 0) {
+          remoteSocket.write(parsed.payload);
+        }
+        if (session.uplinkQueue.length > 0) {
+          for (const q of session.uplinkQueue) {
+            remoteSocket.write(q);
+          }
+          session.uplinkQueue = [];
+        }
+      });
+
+      remoteSocket.on('data', (chunk) => {
+        refreshSessionTimer(session);
+        if (session.downlinkRes && !session.downlinkRes.writableEnded) {
+          if (!session.downlinkRes.write(chunk)) {
+            remoteSocket.pause();
+          }
+        } else {
+          session.downlinkQueue.push(chunk);
+        }
+      });
+
+      if (session.downlinkRes) {
+        session.downlinkRes.on('drain', () => {
+          if (remoteSocket && !remoteSocket.destroyed) remoteSocket.resume();
+        });
+      }
+
+      remoteSocket.on('close', () => cleanupXhttpSession(session.id));
+      remoteSocket.on('error', () => cleanupXhttpSession(session.id));
+      session.remoteSocket = remoteSocket;
+    }
+  } else {
+    if (session.isConnected && session.remoteSocket && !session.remoteSocket.destroyed) {
+      session.remoteSocket.write(data);
+    } else {
+      session.uplinkQueue.push(data);
+    }
+  }
+}
+
+function handleXhttpSession(req, res, pathParts, protocol) {
+  const sessionId = pathParts[1];
+  const session = getOrCreateXhttpSession(sessionId, protocol);
+  refreshSessionTimer(session);
+
+  if (req.method === 'GET') {
+    session.downlinkRes = res;
+    res.writeHead(200, {
+      'Content-Type': 'application/octet-stream',
+      'Transfer-Encoding': 'chunked',
+      'Cache-Control': 'no-cache, no-store, no-transform',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no'
+    });
+
+    if (session.protocol === 'vless' && session.isConnected && !session.handshakeSent) {
+      res.write(Buffer.from([0, 0]));
+      session.handshakeSent = true;
+    }
+
+    if (session.downlinkQueue && session.downlinkQueue.length > 0) {
+      for (const d of session.downlinkQueue) {
+        res.write(d);
+      }
+      session.downlinkQueue = [];
+    }
+
+    res.on('drain', () => {
+      if (session.remoteSocket && !session.remoteSocket.destroyed) {
+        session.remoteSocket.resume();
+      }
+    });
+
+    res.on('close', () => {
+      cleanupXhttpSession(sessionId);
+    });
+    return;
+  }
+
+  if (req.method === 'POST') {
+    const bodyChunks = [];
+    req.on('data', (chunk) => bodyChunks.push(chunk));
+    req.on('end', () => {
+      const data = Buffer.concat(bodyChunks);
+      res.writeHead(200, {
+        'Content-Type': 'text/plain',
+        'Cache-Control': 'no-cache, no-store'
+      });
+      res.end('OK');
+
+      if (data.length > 0) {
+        processXhttpUplinkData(session, data);
+      }
+    });
+    req.on('error', () => cleanupXhttpSession(sessionId));
+    return;
+  }
+
+  res.writeHead(405);
+  res.end('Method Not Allowed');
 }
 
 // ── 1. HTTP 基础服务（Web 伪装、Base64 订阅与 xhttp 分块引擎）────────────────
@@ -323,123 +490,134 @@ const server = http.createServer((req, res) => {
     return res.end(base64Content);
   }
 
-  // ② VLESS + xhttp (SplitHTTP) 原生全双工分块流引擎（带防探测与背压保护）
-  if (reqUrl === PATH_XHTTP && req.method === 'POST') {
-    let isParsed = false;
-    let remoteSocket = null;
-    const chunksQueue = [];
+  const pathParts = reqUrl.split('/').filter(Boolean);
+  const rootSegment = '/' + (pathParts[0] || '');
 
-    req.on('data', (chunk) => {
-      if (!isParsed) {
-        chunksQueue.push(chunk);
-        const fullBuf = Buffer.concat(chunksQueue);
+  // ② VLESS + xhttp (SplitHTTP) - 支持 packet-up 会话多路复用与 stream-one 单流
+  if (rootSegment === PATH_XHTTP) {
+    if (pathParts.length > 1) {
+      return handleXhttpSession(req, res, pathParts, 'vless');
+    }
+    if (req.method === 'POST') {
+      let isParsed = false;
+      let remoteSocket = null;
+      const chunksQueue = [];
 
-        // 头部上限保护：超过 2KB 仍无法解析，判定为非合法 VLESS 报文直接断开
-        if (fullBuf.length > 2048) {
+      req.on('data', (chunk) => {
+        if (!isParsed) {
+          chunksQueue.push(chunk);
+          const fullBuf = Buffer.concat(chunksQueue);
+
+          if (fullBuf.length > 2048) {
+            res.writeHead(400, { 'Content-Type': 'text/plain' });
+            res.end('Bad Request');
+            req.destroy();
+            return;
+          }
+
+          const parsed = parseVlessHeader(fullBuf);
+          if (parsed) {
+            isParsed = true;
+            remoteSocket = net.connect({ host: parsed.targetHost, port: parsed.targetPort }, () => {
+              res.writeHead(200, {
+                'Content-Type': 'application/octet-stream',
+                'Transfer-Encoding': 'chunked',
+                'Cache-Control': 'no-cache, no-store',
+                'Connection': 'keep-alive'
+              });
+              res.write(Buffer.from([0, 0])); // VLESS 握手响应
+              if (parsed.payload.length > 0) remoteSocket.write(parsed.payload);
+
+              remoteSocket.on('data', (d) => {
+                if (!res.write(d)) {
+                  remoteSocket.pause();
+                }
+              });
+              res.on('drain', () => remoteSocket.resume());
+              remoteSocket.on('close', () => res.end());
+              remoteSocket.on('error', () => res.end());
+            });
+            remoteSocket.on('error', () => res.destroy());
+          }
+        } else {
+          if (remoteSocket && !remoteSocket.destroyed) remoteSocket.write(chunk);
+        }
+      });
+
+      req.on('end', () => {
+        if (!isParsed) {
           res.writeHead(400, { 'Content-Type': 'text/plain' });
           res.end('Bad Request');
-          req.destroy();
-          return;
+        } else if (remoteSocket && !remoteSocket.destroyed) {
+          remoteSocket.end();
         }
-
-        const parsed = parseVlessHeader(fullBuf);
-        if (parsed) {
-          isParsed = true;
-          remoteSocket = net.connect({ host: parsed.targetHost, port: parsed.targetPort }, () => {
-            res.writeHead(200, {
-              'Content-Type': 'application/octet-stream',
-              'Transfer-Encoding': 'chunked',
-              'Cache-Control': 'no-cache, no-store',
-              'Connection': 'keep-alive'
-            });
-            res.write(Buffer.from([0, 0])); // VLESS 握手响应
-            if (parsed.payload.length > 0) remoteSocket.write(parsed.payload);
-
-            // 背压流控：HTTP 响应缓冲区满时暂停读取远端，排空后恢复
-            remoteSocket.on('data', (d) => {
-              if (!res.write(d)) {
-                remoteSocket.pause();
-              }
-            });
-            res.on('drain', () => remoteSocket.resume());
-            remoteSocket.on('close', () => res.end());
-            remoteSocket.on('error', () => res.end());
-          });
-          remoteSocket.on('error', () => res.destroy());
-        }
-      } else {
-        if (remoteSocket && !remoteSocket.destroyed) remoteSocket.write(chunk);
-      }
-    });
-
-    req.on('end', () => {
-      if (!isParsed) {
-        res.writeHead(400, { 'Content-Type': 'text/plain' });
-        res.end('Bad Request');
-      } else if (remoteSocket && !remoteSocket.destroyed) {
-        remoteSocket.end();
-      }
-    });
-    req.on('error', () => { if (remoteSocket) remoteSocket.destroy(); });
-    return;
+      });
+      req.on('error', () => { if (remoteSocket) remoteSocket.destroy(); });
+      return;
+    }
   }
 
-  // ③ Trojan + xhttp (SplitHTTP) 原生全双工流引擎（带防探测与背压保护）
-  if (reqUrl === PATH_TROJAN_XHTTP && req.method === 'POST') {
-    let isParsed = false;
-    let remoteSocket = null;
-    const chunksQueue = [];
+  // ③ Trojan + xhttp (SplitHTTP) - 支持 packet-up 会话多路复用与 stream-one 单流
+  if (rootSegment === PATH_TROJAN_XHTTP) {
+    if (pathParts.length > 1) {
+      return handleXhttpSession(req, res, pathParts, 'trojan');
+    }
+    if (req.method === 'POST') {
+      let isParsed = false;
+      let remoteSocket = null;
+      const chunksQueue = [];
 
-    req.on('data', (chunk) => {
-      if (!isParsed) {
-        chunksQueue.push(chunk);
-        const fullBuf = Buffer.concat(chunksQueue);
+      req.on('data', (chunk) => {
+        if (!isParsed) {
+          chunksQueue.push(chunk);
+          const fullBuf = Buffer.concat(chunksQueue);
 
-        if (fullBuf.length > 2048) {
+          if (fullBuf.length > 2048) {
+            res.writeHead(400, { 'Content-Type': 'text/plain' });
+            res.end('Bad Request');
+            req.destroy();
+            return;
+          }
+
+          const parsed = parseTrojanHeader(fullBuf);
+          if (parsed) {
+            isParsed = true;
+            remoteSocket = net.connect({ host: parsed.targetHost, port: parsed.targetPort }, () => {
+              res.writeHead(200, {
+                'Content-Type': 'application/octet-stream',
+                'Transfer-Encoding': 'chunked',
+                'Cache-Control': 'no-cache, no-store',
+                'Connection': 'keep-alive'
+              });
+              if (parsed.payload.length > 0) remoteSocket.write(parsed.payload);
+
+              remoteSocket.on('data', (d) => {
+                if (!res.write(d)) {
+                  remoteSocket.pause();
+                }
+              });
+              res.on('drain', () => remoteSocket.resume());
+              remoteSocket.on('close', () => res.end());
+              remoteSocket.on('error', () => res.end());
+            });
+            remoteSocket.on('error', () => res.destroy());
+          }
+        } else {
+          if (remoteSocket && !remoteSocket.destroyed) remoteSocket.write(chunk);
+        }
+      });
+
+      req.on('end', () => {
+        if (!isParsed) {
           res.writeHead(400, { 'Content-Type': 'text/plain' });
           res.end('Bad Request');
-          req.destroy();
-          return;
+        } else if (remoteSocket && !remoteSocket.destroyed) {
+          remoteSocket.end();
         }
-
-        const parsed = parseTrojanHeader(fullBuf);
-        if (parsed) {
-          isParsed = true;
-          remoteSocket = net.connect({ host: parsed.targetHost, port: parsed.targetPort }, () => {
-            res.writeHead(200, {
-              'Content-Type': 'application/octet-stream',
-              'Transfer-Encoding': 'chunked',
-              'Cache-Control': 'no-cache, no-store',
-              'Connection': 'keep-alive'
-            });
-            if (parsed.payload.length > 0) remoteSocket.write(parsed.payload);
-
-            remoteSocket.on('data', (d) => {
-              if (!res.write(d)) {
-                remoteSocket.pause();
-              }
-            });
-            res.on('drain', () => remoteSocket.resume());
-            remoteSocket.on('close', () => res.end());
-            remoteSocket.on('error', () => res.end());
-          });
-          remoteSocket.on('error', () => res.destroy());
-        }
-      } else {
-        if (remoteSocket && !remoteSocket.destroyed) remoteSocket.write(chunk);
-      }
-    });
-
-    req.on('end', () => {
-      if (!isParsed) {
-        res.writeHead(400, { 'Content-Type': 'text/plain' });
-        res.end('Bad Request');
-      } else if (remoteSocket && !remoteSocket.destroyed) {
-        remoteSocket.end();
-      }
-    });
-    req.on('error', () => { if (remoteSocket) remoteSocket.destroy(); });
-    return;
+      });
+      req.on('error', () => { if (remoteSocket) remoteSocket.destroy(); });
+      return;
+    }
   }
 
   // ④ 根路径展示静态海边日记伪装博客

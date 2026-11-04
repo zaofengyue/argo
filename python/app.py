@@ -323,9 +323,9 @@ def generate_node_links(host: str, prefer_host: str) -> list[str]:
     path_trojan_xhttp = urllib.parse.quote(PATH_TROJAN_XHTTP)
     path_trojan = urllib.parse.quote(PATH_TROJAN)
 
-    vless_xhttp  = f"vless://{UUID}@{prefer_host}:443?encryption=none&security=tls&type=xhttp&host={host}&path={path_xhttp}&sni={host}#{remark}"
+    vless_xhttp  = f"vless://{UUID}@{prefer_host}:443?encryption=none&security=tls&type=xhttp&host={host}&path={path_xhttp}&mode=packet-up&sni={host}#{remark}"
     vless_ws     = f"vless://{UUID}@{prefer_host}:443?encryption=none&security=tls&type=ws&host={host}&path={path_vless}&sni={host}#{remark}"
-    trojan_xhttp = f"trojan://{PASSWORD}@{prefer_host}:443?security=tls&type=xhttp&host={host}&path={path_trojan_xhttp}&sni={host}#{remark}"
+    trojan_xhttp = f"trojan://{PASSWORD}@{prefer_host}:443?security=tls&type=xhttp&host={host}&path={path_trojan_xhttp}&mode=packet-up&sni={host}#{remark}"
     trojan_ws    = f"trojan://{PASSWORD}@{prefer_host}:443?security=tls&type=ws&host={host}&path={path_trojan}&sni={host}#{remark}"
 
     return [vless_xhttp, vless_ws, trojan_xhttp, trojan_ws]
@@ -675,6 +675,173 @@ async def handle_sub(request):
         content_type='text/plain; charset=utf-8',
         headers={'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0'}
     )
+
+# ── XHTTP (SplitHTTP) 会话多路复用连接池 (packet-up 架构) ───────────────────
+xhttp_sessions: dict[str, dict] = {}
+
+def get_or_create_xhttp_session(session_id: str, protocol: str = 'vless') -> dict:
+    sess = xhttp_sessions.get(session_id)
+    if not sess:
+        sess = {
+            'id': session_id,
+            'protocol': protocol,
+            'r_reader': None,
+            'r_writer': None,
+            'downlink_queue': asyncio.Queue(),
+            'uplink_queue': asyncio.Queue(),
+            'is_parsed': False,
+            'is_connected': False,
+            'handshake_sent': False,
+            'header_buf': bytearray(),
+            'closed': False,
+            'tasks': []
+        }
+        xhttp_sessions[session_id] = sess
+    return sess
+
+async def cleanup_xhttp_session(session_id: str):
+    sess = xhttp_sessions.pop(session_id, None)
+    if not sess:
+        return
+    sess['closed'] = True
+    if sess.get('r_writer'):
+        try:
+            sess['r_writer'].close()
+            await sess['r_writer'].wait_closed()
+        except Exception:
+            pass
+    try:
+        sess['downlink_queue'].put_nowait(None)
+    except Exception:
+        pass
+    for t in sess.get('tasks', []):
+        if not t.done():
+            t.cancel()
+
+async def process_xhttp_uplink(sess: dict, data: bytes):
+    if sess['closed']:
+        return
+    if not sess['is_parsed']:
+        sess['header_buf'].extend(data)
+        if len(sess['header_buf']) > 2048:
+            await cleanup_xhttp_session(sess['id'])
+            return
+        parsed = parse_vless_header(bytes(sess['header_buf'])) if sess['protocol'] == 'vless' else parse_trojan_header(bytes(sess['header_buf']))
+        if parsed:
+            sess['is_parsed'] = True
+            try:
+                r_reader, r_writer = await asyncio.open_connection(parsed['target_host'], parsed['target_port'])
+                sess['r_reader'] = r_reader
+                sess['r_writer'] = r_writer
+                sess['is_connected'] = True
+            except Exception:
+                await cleanup_xhttp_session(sess['id'])
+                return
+
+            if sess['protocol'] == 'vless' and not sess['handshake_sent']:
+                await sess['downlink_queue'].put(b'\x00\x00')
+                sess['handshake_sent'] = True
+
+            if parsed.get('payload'):
+                r_writer.write(parsed['payload'])
+                await r_writer.drain()
+
+            while not sess['uplink_queue'].empty():
+                q_item = await sess['uplink_queue'].get()
+                r_writer.write(q_item)
+                await r_writer.drain()
+
+            async def remote_reader():
+                try:
+                    while not sess['closed']:
+                        chunk = await r_reader.read(65536)
+                        if not chunk:
+                            break
+                        await sess['downlink_queue'].put(chunk)
+                except Exception:
+                    pass
+                finally:
+                    await cleanup_xhttp_session(sess['id'])
+
+            task = asyncio.create_task(remote_reader())
+            sess['tasks'].append(task)
+    else:
+        if sess['is_connected'] and sess.get('r_writer'):
+            try:
+                sess['r_writer'].write(data)
+                await sess['r_writer'].drain()
+            except Exception:
+                await cleanup_xhttp_session(sess['id'])
+        else:
+            await sess['uplink_queue'].put(data)
+
+@routes.get(f"{PATH_XHTTP}/{{session_id}}")
+async def handle_vless_xhttp_get(request):
+    session_id = request.match_info['session_id']
+    sess = get_or_create_xhttp_session(session_id, 'vless')
+    resp = web.StreamResponse(status=200, headers={
+        'Content-Type': 'application/octet-stream',
+        'Transfer-Encoding': 'chunked',
+        'Cache-Control': 'no-cache, no-store, no-transform',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no'
+    })
+    await resp.prepare(request)
+    try:
+        while not sess['closed']:
+            data = await sess['downlink_queue'].get()
+            if data is None:
+                break
+            await resp.write(data)
+    except Exception:
+        pass
+    finally:
+        await cleanup_xhttp_session(session_id)
+    return resp
+
+@routes.post(f"{PATH_XHTTP}/{{session_id}}")
+@routes.post(f"{PATH_XHTTP}/{{session_id}}/{{seq}}")
+async def handle_vless_xhttp_post(request):
+    session_id = request.match_info['session_id']
+    sess = get_or_create_xhttp_session(session_id, 'vless')
+    data = await request.read()
+    if data:
+        await process_xhttp_uplink(sess, data)
+    return web.Response(status=200, text="OK")
+
+@routes.get(f"{PATH_TROJAN_XHTTP}/{{session_id}}")
+async def handle_trojan_xhttp_get(request):
+    session_id = request.match_info['session_id']
+    sess = get_or_create_xhttp_session(session_id, 'trojan')
+    resp = web.StreamResponse(status=200, headers={
+        'Content-Type': 'application/octet-stream',
+        'Transfer-Encoding': 'chunked',
+        'Cache-Control': 'no-cache, no-store, no-transform',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no'
+    })
+    await resp.prepare(request)
+    try:
+        while not sess['closed']:
+            data = await sess['downlink_queue'].get()
+            if data is None:
+                break
+            await resp.write(data)
+    except Exception:
+        pass
+    finally:
+        await cleanup_xhttp_session(session_id)
+    return resp
+
+@routes.post(f"{PATH_TROJAN_XHTTP}/{{session_id}}")
+@routes.post(f"{PATH_TROJAN_XHTTP}/{{session_id}}/{{seq}}")
+async def handle_trojan_xhttp_post(request):
+    session_id = request.match_info['session_id']
+    sess = get_or_create_xhttp_session(session_id, 'trojan')
+    data = await request.read()
+    if data:
+        await process_xhttp_uplink(sess, data)
+    return web.Response(status=200, text="OK")
 
 @routes.post(PATH_XHTTP)
 async def handle_xhttp(request):
