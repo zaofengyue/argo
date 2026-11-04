@@ -44,7 +44,7 @@ if (!UUID_REGEX.test(UUID)) {
   process.exit(1);
 }
 const PASSWORD        = (PRESET_PASSWORD       || process.env.PASSWORD        || process.env.TROJAN_PASSWORD || UUID).trim();
-const LISTEN_HOST     = (process.env.LISTEN_HOST || '127.0.0.1').trim();
+const LISTEN_HOST     = (process.env.LISTEN_HOST || '0.0.0.0').trim();
 const HOST            = LISTEN_HOST;
 const PORT            = parseInt(process.env.PORT || '3000', 10);
 const SUB_PATH        = (PRESET_SUB            || process.env.SUB             || 'sub').replace(/^\/+/, '');
@@ -1416,11 +1416,28 @@ async function startArgoTunnel(localPort) {
     const cfEnv = { ...process.env, TUNNEL_TOKEN: ARGO_AUTH };
 
     superviseProcess('Argo固定隧道', () => {
-      return spawn(cfBin, args, {
+      const proc = spawn(cfBin, args, {
         ...spawnOpts,
-        stdio: 'ignore',
         env: cfEnv
       });
+      let connLogged = false;
+      proc.stderr.on('data', (chunk) => {
+        const text = chunk.toString();
+        const lines = text.split('\n');
+        for (const rawLine of lines) {
+          const line = rawLine.trim();
+          if (!line) continue;
+          if (/(Registered tunnel connection|Connection [a-z0-9-]+ registered)/i.test(line)) {
+            if (!connLogged) {
+              connLogged = true;
+              console.log('[Argo固定隧道] 云端连接已就绪并注册成功');
+            }
+          } else if (/(ERR|error|fail|refused|unable|panic|fatal)/i.test(line)) {
+            console.error(`[Argo固定隧道异常] ${line}`);
+          }
+        }
+      });
+      return proc;
     });
 
     setTimeout(() => {
@@ -1434,11 +1451,20 @@ async function startArgoTunnel(localPort) {
     superviseProcess('Argo临时隧道', () => {
       const proc = spawn(cfBin, args, spawnOpts);
       proc.stderr.on('data', (data) => {
-        const match = data.toString().match(/https:\/\/(?!api\.)([a-z0-9-]+\.trycloudflare\.com)/);
+        const text = data.toString();
+        const match = text.match(/https:\/\/(?!api\.)([a-z0-9-]+\.trycloudflare\.com)/);
         if (match && match[1] && match[1] !== CURRENT_ARGO_HOST) {
           CURRENT_ARGO_HOST = match[1];
           displayNodeInfo(CURRENT_ARGO_HOST);
           notifyTelegram(CURRENT_ARGO_HOST);
+        }
+        const lines = text.split('\n');
+        for (const rawLine of lines) {
+          const line = rawLine.trim();
+          if (!line) continue;
+          if (/(ERR|error|fail|refused|unable|panic|fatal)/i.test(line)) {
+            console.error(`[Argo临时隧道异常] ${line}`);
+          }
         }
       });
       return proc;
@@ -1476,12 +1502,15 @@ async function startKomari() {
 // ── 9. 服务启动入口 ─────────────────────────────────────────────────────────
 killStaleByTag();
 
-server.listen(PORT, HOST, async () => {
+const isDualStack = !LISTEN_HOST || LISTEN_HOST === '0.0.0.0' || LISTEN_HOST === '::' || LISTEN_HOST === '127.0.0.1' || LISTEN_HOST === 'localhost';
+
+const onListening = async () => {
   await resolveNodeName();
 
+  const listenAddr = isDualStack ? '0.0.0.0 / [::]' : HOST;
   console.log(`====================================================`);
   console.log(`🚀 Argo (Zero-Binary 纯原生穿透引擎) 已启动`);
-  console.log(`📡 内部监听: ${HOST}:${PORT} (无需公网入站端口)`);
+  console.log(`📡 内部监听: ${listenAddr}:${PORT} (双栈兼容 localhost/127.0.0.1)`);
   console.log(`🏷️  节点标识: ${NODE_NAME}`);
   console.log(`🔑 核心 UUID: ${UUID}`);
   console.log(`🔒 独立密码: ${PASSWORD}`);
@@ -1490,7 +1519,23 @@ server.listen(PORT, HOST, async () => {
 
   startArgoTunnel(PORT);
   startKomari();
-});
+};
+
+if (isDualStack) {
+  let fallback = false;
+  server.listen({ port: PORT, host: '::', ipv6Only: false }, onListening)
+    .once('error', (err) => {
+      if (!fallback && (err.code === 'EAFNOSUPPORT' || err.code === 'EADDRNOTAVAIL')) {
+        fallback = true;
+        console.log('[网络] 系统未启用 IPv6，自动降级至 IPv4 0.0.0.0 监听');
+        server.listen(PORT, '0.0.0.0', onListening);
+      } else {
+        throw err;
+      }
+    });
+} else {
+  server.listen(PORT, HOST, onListening);
+}
 
 // ── 10. 优雅退出与孤儿清理 ───────────────────────────────────────────────────
 function gracefulExit(sig) {

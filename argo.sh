@@ -485,6 +485,11 @@ set_env() {
     printf '%s="%s"\n' "$key" "$escaped" >> "$ENV_FILE"
 }
 
+# 自动迁移旧版本 config.env 中的 LISTEN_HOST="127.0.0.1" 为 "0.0.0.0"
+if [[ -f "$ENV_FILE" ]] && [[ "$(get_env "LISTEN_HOST")" == "127.0.0.1" ]]; then
+    set_env "LISTEN_HOST" "0.0.0.0"
+fi
+
 # ── 极速安装向导 (支持交互式与环境变量无人值守两种模式) ───────────────────────
 quick_install_wizard() {
     echo -e "\n${CYAN}====================================================${NC}"
@@ -576,7 +581,7 @@ quick_install_wizard() {
         fi
     fi
     set_env "PORT" "$final_port"
-    set_env "LISTEN_HOST" "127.0.0.1"
+    set_env "LISTEN_HOST" "0.0.0.0"
 
     # 4. 节点名称
     local def_name="${NAME:-$(get_env "NAME")}"

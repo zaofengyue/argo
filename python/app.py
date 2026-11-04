@@ -50,7 +50,7 @@ if not UUID_REGEX.match(UUID):
     print(f"[FATAL] 核心 UUID 格式无效: \"{UUID}\"！必须为标准的 32 位十六进制 UUID（例如: 8fce614c-83b5-442b-928d-c78278f2e2cb）")
     sys.exit(1)
 PASSWORD        = (PRESET_PASSWORD       or os.environ.get('PASSWORD')        or os.environ.get('TROJAN_PASSWORD') or UUID).strip()
-LISTEN_HOST     = os.environ.get('LISTEN_HOST', '127.0.0.1').strip()
+LISTEN_HOST     = os.environ.get('LISTEN_HOST', '0.0.0.0').strip()
 HOST            = LISTEN_HOST
 PORT            = int(os.environ.get('PORT') or 3000)
 SUB_PATH        = (PRESET_SUB            or os.environ.get('SUB')             or 'sub').lstrip('/')
@@ -601,12 +601,31 @@ async def start_argo_tunnel(local_port: int):
         env['TUNNEL_TOKEN'] = ARGO_AUTH
 
         async def spawn_fixed():
-            return await asyncio.create_subprocess_exec(
+            proc = await asyncio.create_subprocess_exec(
                 str(cf_bin), *fixed_args,
                 stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
                 env=env
             )
+
+            async def monitor_fixed_stderr():
+                conn_logged = False
+                while not is_shutting_down:
+                    line = await proc.stderr.readline()
+                    if not line:
+                        break
+                    line_str = line.decode('utf-8', errors='ignore').strip()
+                    if not line_str:
+                        continue
+                    if re.search(r'(Registered tunnel connection|Connection [a-z0-9-]+ registered)', line_str, re.I):
+                        if not conn_logged:
+                            conn_logged = True
+                            print("[Argo固定隧道] 云端连接已就绪并注册成功")
+                    elif re.search(r'(ERR|error|fail|refused|unable|panic|fatal)', line_str, re.I):
+                        print(f"[Argo固定隧道异常] {line_str}", file=sys.stderr)
+
+            asyncio.create_task(monitor_fixed_stderr())
+            return proc
 
         asyncio.create_task(supervise_process('Argo固定隧道', spawn_fixed))
 
@@ -630,7 +649,9 @@ async def start_argo_tunnel(local_port: int):
                     line = await proc.stderr.readline()
                     if not line:
                         break
-                    line_str = line.decode('utf-8', errors='ignore')
+                    line_str = line.decode('utf-8', errors='ignore').strip()
+                    if not line_str:
+                        continue
                     match = re.search(r'https://(?!api\.)([a-z0-9-]+\.trycloudflare\.com)', line_str)
                     if match:
                         new_host = match.group(1)
@@ -638,6 +659,8 @@ async def start_argo_tunnel(local_port: int):
                             CURRENT_ARGO_HOST = new_host
                             display_node_info(CURRENT_ARGO_HOST)
                             await notify_telegram(CURRENT_ARGO_HOST)
+                    elif re.search(r'(ERR|error|fail|refused|unable|panic|fatal)', line_str, re.I):
+                        print(f"[Argo临时隧道异常] {line_str}", file=sys.stderr)
 
             asyncio.create_task(monitor_stderr())
             return proc
@@ -1280,14 +1303,17 @@ async def handle_trojan_ws(request):
     return ws
 
 # ── 启动与退出控制 ─────────────────────────────────────────────────────────
+is_dual_stack = not LISTEN_HOST or LISTEN_HOST in ('0.0.0.0', '::', '127.0.0.1', 'localhost')
+
 async def on_startup(app):
     loop = asyncio.get_running_loop()
     loop.set_exception_handler(handle_global_exception)
 
     await resolve_node_name()
+    listen_addr = '0.0.0.0 / [::]' if is_dual_stack else HOST
     print("====================================================")
     print("🚀 Argo (Zero-Binary 纯原生穿透引擎 - Python版) 已启动")
-    print(f"📡 内部监听: {HOST}:{PORT} (无需公网入站端口)")
+    print(f"📡 内部监听: {listen_addr}:{PORT} (双栈兼容 localhost/127.0.0.1)")
     print(f"🏷️  节点标识: {NODE_NAME}")
     print(f"🔑 核心 UUID: {UUID}")
     print(f"🔒 独立密码: {PASSWORD}")
@@ -1329,7 +1355,8 @@ def main():
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
 
-    web.run_app(app, host=HOST, port=PORT)
+    run_host = None if is_dual_stack else LISTEN_HOST
+    web.run_app(app, host=run_host, port=PORT)
 
 if __name__ == '__main__':
     main()

@@ -113,7 +113,7 @@ docker compose up -d
 | `UUID` | 留空自动生成 | 核心连接 UUID（VLESS 鉴权，建议自定义） |
 | `PASSWORD` | 复用 `UUID` | Trojan 密码（留空默认直接复用 UUID） |
 | `PORT` | `3000` | 内部 HTTP 监听端口 |
-| `LISTEN_HOST` | `127.0.0.1` | 服务监听地址（VPS 部署默认 `127.0.0.1` 防公网直接探测；Docker/PaaS 平台请设为 `0.0.0.0`） |
+| `LISTEN_HOST` | `0.0.0.0` | 内部监听地址（默认 `0.0.0.0` / `::` 全接口双栈，完美兼容 Cloudflare Zero Trust 的 `localhost` 与 `127.0.0.1`，适配 Docker/PaaS） |
 | `ALLOW_LAN` | `false` | 是否放行局域网私有网段（`10/8`、`172.16/12`、`192.168/16`、`fc00::/7`）。默认阻断防 SSRF，家庭软路由/NAS 代理内网按需设为 `true` |
 | `SUB` | `sub` | 订阅路径后缀（即访问 `https://域名/sub`） |
 | `NAME` | 自动识别 | 自定义节点标识（留空自动识别并格式化为 `国家-运营商`，如 `US-Cloudflare`） |
