@@ -315,18 +315,23 @@ def parse_trojan_header(buf: bytes):
         'payload': buf[cursor:]
     }
 
-# ── 节点链接生成器（原生高能 4 组合，名称仅 国家+运营商）───────────────────
+# ── 节点链接生成器（原生高能组合，名称仅 国家+运营商）───────────────────
 def generate_node_links(host: str, prefer_host: str) -> list[str]:
     remark = urllib.parse.quote(NODE_NAME or 'argo')
-    path_xhttp = urllib.parse.quote(PATH_XHTTP)
     path_vless = urllib.parse.quote(PATH_VLESS)
-    path_trojan_xhttp = urllib.parse.quote(PATH_TROJAN_XHTTP)
     path_trojan = urllib.parse.quote(PATH_TROJAN)
 
-    vless_xhttp  = f"vless://{UUID}@{prefer_host}:443?encryption=none&security=tls&type=xhttp&host={host}&path={path_xhttp}&mode=packet-up&sni={host}#{remark}"
     vless_ws     = f"vless://{UUID}@{prefer_host}:443?encryption=none&security=tls&type=ws&host={host}&path={path_vless}&sni={host}#{remark}"
-    trojan_xhttp = f"trojan://{PASSWORD}@{prefer_host}:443?security=tls&type=xhttp&host={host}&path={path_trojan_xhttp}&mode=packet-up&sni={host}#{remark}"
     trojan_ws    = f"trojan://{PASSWORD}@{prefer_host}:443?security=tls&type=ws&host={host}&path={path_trojan}&sni={host}#{remark}"
+
+    # XHTTP (SplitHTTP) 仅在配置固定隧道 (ARGO_DOMAIN) 时激活生成
+    if not ARGO_DOMAIN:
+        return [vless_ws, trojan_ws]
+
+    path_xhttp = urllib.parse.quote(PATH_XHTTP)
+    path_trojan_xhttp = urllib.parse.quote(PATH_TROJAN_XHTTP)
+    vless_xhttp  = f"vless://{UUID}@{prefer_host}:443?encryption=none&security=tls&type=xhttp&host={host}&path={path_xhttp}&mode=packet-up&sni={host}#{remark}"
+    trojan_xhttp = f"trojan://{PASSWORD}@{prefer_host}:443?security=tls&type=xhttp&host={host}&path={path_trojan_xhttp}&mode=packet-up&sni={host}#{remark}"
 
     return [vless_xhttp, vless_ws, trojan_xhttp, trojan_ws]
 
@@ -777,6 +782,8 @@ async def process_xhttp_uplink(sess: dict, data: bytes):
 
 @routes.get(f"{PATH_XHTTP}/{{session_id}}")
 async def handle_vless_xhttp_get(request):
+    if not ARGO_DOMAIN:
+        return web.Response(status=404, text="Not Found")
     session_id = request.match_info['session_id']
     sess = get_or_create_xhttp_session(session_id, 'vless')
     resp = web.StreamResponse(status=200, headers={
@@ -802,6 +809,8 @@ async def handle_vless_xhttp_get(request):
 @routes.post(f"{PATH_XHTTP}/{{session_id}}")
 @routes.post(f"{PATH_XHTTP}/{{session_id}}/{{seq}}")
 async def handle_vless_xhttp_post(request):
+    if not ARGO_DOMAIN:
+        return web.Response(status=404, text="Not Found")
     session_id = request.match_info['session_id']
     sess = get_or_create_xhttp_session(session_id, 'vless')
     data = await request.read()
@@ -811,6 +820,8 @@ async def handle_vless_xhttp_post(request):
 
 @routes.get(f"{PATH_TROJAN_XHTTP}/{{session_id}}")
 async def handle_trojan_xhttp_get(request):
+    if not ARGO_DOMAIN:
+        return web.Response(status=404, text="Not Found")
     session_id = request.match_info['session_id']
     sess = get_or_create_xhttp_session(session_id, 'trojan')
     resp = web.StreamResponse(status=200, headers={
@@ -836,6 +847,8 @@ async def handle_trojan_xhttp_get(request):
 @routes.post(f"{PATH_TROJAN_XHTTP}/{{session_id}}")
 @routes.post(f"{PATH_TROJAN_XHTTP}/{{session_id}}/{{seq}}")
 async def handle_trojan_xhttp_post(request):
+    if not ARGO_DOMAIN:
+        return web.Response(status=404, text="Not Found")
     session_id = request.match_info['session_id']
     sess = get_or_create_xhttp_session(session_id, 'trojan')
     data = await request.read()
@@ -845,6 +858,8 @@ async def handle_trojan_xhttp_post(request):
 
 @routes.post(PATH_XHTTP)
 async def handle_xhttp(request):
+    if not ARGO_DOMAIN:
+        return web.Response(status=404, text="Not Found")
     # VLESS + xhttp (SplitHTTP) 原生全双工流（带 2KB 头部防探测保护）
     content = request.content
     first_chunk = await content.read(2048)
@@ -902,6 +917,8 @@ async def handle_xhttp(request):
 
 @routes.post(PATH_TROJAN_XHTTP)
 async def handle_trojan_xhttp(request):
+    if not ARGO_DOMAIN:
+        return web.Response(status=404, text="Not Found")
     # Trojan + xhttp (SplitHTTP) 原生全双工流（带 2KB 头部防探测保护）
     content = request.content
     first_chunk = await content.read(2048)

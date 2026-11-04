@@ -33,19 +33,47 @@ WHITE='\033[1;37m'
 NC='\033[0m'
 
 # ── 路径与常量 ────────────────────────────────────────────────────────────────
-APP_DIR="/opt/argo"
+if [[ $(id -u 2>/dev/null || echo 1) -eq 0 ]]; then
+    IS_ROOT=1
+    APP_DIR="/opt/argo"
+    BIN_DIR="/usr/local/bin"
+    SVC_SYSTEMD="/etc/systemd/system/${SVC_NAME}.service"
+    SVC_OPENRC="/etc/init.d/${SVC_NAME}"
+    LOG_FILE="/var/log/argo.log"
+else
+    IS_ROOT=0
+    APP_DIR="${HOME}/.argo"
+    BIN_DIR="${HOME}/.local/bin"
+    SVC_SYSTEMD="${HOME}/.config/systemd/user/${SVC_NAME}.service"
+    SVC_OPENRC=""
+    LOG_FILE="${APP_DIR}/argo.log"
+fi
 ENV_FILE="$APP_DIR/config.env"
 SVC_NAME="argo"
-SVC_SYSTEMD="/etc/systemd/system/${SVC_NAME}.service"
-SVC_OPENRC="/etc/init.d/${SVC_NAME}"
-OPENRC_LOG="/var/log/argo.log"
-BIN_LINK="/usr/local/bin/argo"
+BIN_LINK="${BIN_DIR}/argo"
+BIN_LINK_AG="${BIN_DIR}/ag"
+PID_FILE="${APP_DIR}/argo.pid"
 REPO_RAW="https://raw.githubusercontent.com/zaofengyue/argo/main"
 
 # ── 日志工具 ──────────────────────────────────────────────────────────────────
 log_info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
+
+# ── 环境变量 PATH 注入封装 ───────────────────────────────────────────────────
+ensure_bin_path() {
+    mkdir -p "$BIN_DIR"
+    if [[ "$IS_ROOT" -eq 0 ]]; then
+        if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+            export PATH="$BIN_DIR:$PATH"
+        fi
+        for rc in "$HOME/.bashrc" "$HOME/.profile"; do
+            if [[ -f "$rc" ]] && ! grep -q "\.local/bin" "$rc" 2>/dev/null; then
+                echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc"
+            fi
+        done
+    fi
+}
 
 # ── 下载双引擎容灾封装 (curl / wget 互备，自动防 CDN 缓存) ──────────────
 fetch_file() {
@@ -108,54 +136,130 @@ check_port_available() {
 
 # ── 权限与系统检查 ────────────────────────────────────────────────────────────
 check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        log_error "本脚本需要 root 权限运行，请使用 sudo -i 或切换为 root 用户后执行！"
-        exit 1
+    if [[ "$IS_ROOT" -eq 0 ]]; then
+        log_info "当前运行在普通用户模式 (UID: $(id -u))，数据将安装在用户目录 ($APP_DIR)"
+    fi
+}
+
+require_root() {
+    if [[ "$IS_ROOT" -eq 0 ]]; then
+        log_error "该操作需要 root 权限，当前为普通用户模式无法执行！"
+        return 1
+    fi
+}
+
+find_node_bin() {
+    if [[ -x "$APP_DIR/node/bin/node" ]]; then
+        echo "$APP_DIR/node/bin/node"
+    elif command -v node >/dev/null 2>&1; then
+        command -v node
+    else
+        echo "node"
     fi
 }
 
 INIT_TYPE=""
 check_init_system() {
-    if command -v systemctl >/dev/null 2>&1; then
-        INIT_TYPE="systemd"
-    elif command -v rc-service >/dev/null 2>&1 || [ -f /etc/alpine-release ]; then
-        INIT_TYPE="openrc"
+    if [[ "$IS_ROOT" -eq 1 ]]; then
+        if command -v systemctl >/dev/null 2>&1; then
+            INIT_TYPE="systemd"
+        elif command -v rc-service >/dev/null 2>&1 || [ -f /etc/alpine-release ]; then
+            INIT_TYPE="openrc"
+        else
+            INIT_TYPE="nohup_cron"
+        fi
     else
-        log_error "当前系统既不支持 systemd 也不支持 OpenRC，本脚本暂不支持当前环境！"
-        exit 1
+        if command -v systemctl >/dev/null 2>&1 && systemctl --user list-units >/dev/null 2>&1; then
+            INIT_TYPE="systemd_user"
+        else
+            INIT_TYPE="nohup_cron"
+        fi
     fi
 }
 
-# ── 服务操作封装 (兼容 systemd 与 OpenRC) ──────────────────────────────────────
+# ── 服务操作封装 (兼容 systemd, user-systemd, OpenRC 与 nohup_cron) ───────────
 svc_start() {
     if [[ "$INIT_TYPE" == "systemd" ]]; then
         systemctl start "$SVC_NAME"
+    elif [[ "$INIT_TYPE" == "systemd_user" ]]; then
+        systemctl --user start "$SVC_NAME"
     elif [[ "$INIT_TYPE" == "openrc" ]]; then
         rc-service "$SVC_NAME" start
+    elif [[ "$INIT_TYPE" == "nohup_cron" ]]; then
+        if svc_is_active; then
+            return 0
+        fi
+        local node_bin
+        node_bin=$(find_node_bin)
+        mkdir -p "$APP_DIR"
+        touch "$LOG_FILE"
+        (
+            cd "$APP_DIR/nodejs" || exit 1
+            if [[ -f "$ENV_FILE" ]]; then
+                set -a
+                # shellcheck source=/dev/null
+                source "$ENV_FILE" 2>/dev/null || true
+                set +a
+            fi
+            nohup "$node_bin" index.js >> "$LOG_FILE" 2>&1 &
+            echo $! > "$PID_FILE"
+        )
     fi
 }
 
 svc_stop() {
     if [[ "$INIT_TYPE" == "systemd" ]]; then
         systemctl stop "$SVC_NAME"
+    elif [[ "$INIT_TYPE" == "systemd_user" ]]; then
+        systemctl --user stop "$SVC_NAME"
     elif [[ "$INIT_TYPE" == "openrc" ]]; then
         rc-service "$SVC_NAME" stop
+    elif [[ "$INIT_TYPE" == "nohup_cron" ]]; then
+        if [[ -f "$PID_FILE" ]]; then
+            local pid
+            pid=$(cat "$PID_FILE" 2>/dev/null)
+            if [[ -n "$pid" ]]; then
+                kill "$pid" 2>/dev/null || true
+                sleep 0.5
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+            rm -f "$PID_FILE"
+        fi
+        pkill -u "$(id -u)" -f "$APP_DIR/nodejs/index.js" 2>/dev/null || true
+        pkill -u "$(id -u)" -f "node /app/bridge.js" 2>/dev/null || true
     fi
 }
 
 svc_restart() {
     if [[ "$INIT_TYPE" == "systemd" ]]; then
         systemctl restart "$SVC_NAME"
+    elif [[ "$INIT_TYPE" == "systemd_user" ]]; then
+        systemctl --user restart "$SVC_NAME"
     elif [[ "$INIT_TYPE" == "openrc" ]]; then
         rc-service "$SVC_NAME" restart 2>/dev/null || { rc-service "$SVC_NAME" stop >/dev/null 2>&1; rc-service "$SVC_NAME" start; }
+    elif [[ "$INIT_TYPE" == "nohup_cron" ]]; then
+        svc_stop
+        sleep 1
+        svc_start
     fi
 }
 
 svc_is_active() {
     if [[ "$INIT_TYPE" == "systemd" ]]; then
         systemctl is-active --quiet "$SVC_NAME"
+    elif [[ "$INIT_TYPE" == "systemd_user" ]]; then
+        systemctl --user is-active --quiet "$SVC_NAME"
     elif [[ "$INIT_TYPE" == "openrc" ]]; then
         rc-service "$SVC_NAME" status 2>/dev/null | grep -q "started"
+    elif [[ "$INIT_TYPE" == "nohup_cron" ]]; then
+        if [[ -f "$PID_FILE" ]]; then
+            local pid
+            pid=$(cat "$PID_FILE" 2>/dev/null)
+            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                return 0
+            fi
+        fi
+        pgrep -u "$(id -u)" -f "$APP_DIR/nodejs/index.js" >/dev/null 2>&1
     else
         return 1
     fi
@@ -236,19 +340,27 @@ nat64_restore_temp() {
 # ── 包管理器探测与依赖安装 ───────────────────────────────────────────────────
 install_dependencies() {
     nat64_enable_temp
-    log_info "正在检测并安装基础依赖 (curl, wget, tar, git, ca-certificates)..."
-    if command -v apk >/dev/null 2>&1; then
-        apk update
-        apk add --no-cache curl wget tar git ca-certificates openssl procps bash nodejs npm
-    elif command -v apt-get >/dev/null 2>&1; then
-        apt-get update -y
-        apt-get install -y curl wget tar git ca-certificates openssl procps
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y curl wget tar git ca-certificates openssl procps-ng
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y curl wget tar git ca-certificates openssl procps-ng
-    elif command -v pacman >/dev/null 2>&1; then
-        pacman -Sy --noconfirm curl wget tar git ca-certificates openssl procps-ng
+    if [[ "$IS_ROOT" -eq 1 ]]; then
+        log_info "正在检测并安装基础依赖 (curl, wget, tar, git, ca-certificates)..."
+        if command -v apk >/dev/null 2>&1; then
+            apk update
+            apk add --no-cache curl wget tar git ca-certificates openssl procps bash nodejs npm
+        elif command -v apt-get >/dev/null 2>&1; then
+            apt-get update -y
+            apt-get install -y curl wget tar git ca-certificates openssl procps
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y curl wget tar git ca-certificates openssl procps-ng
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y curl wget tar git ca-certificates openssl procps-ng
+        elif command -v pacman >/dev/null 2>&1; then
+            pacman -Sy --noconfirm curl wget tar git ca-certificates openssl procps-ng
+        fi
+    else
+        log_info "普通用户模式：跳过系统包管理器安装，复用现有用户环境基础工具..."
+        if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+            log_error "系统未找到 curl 或 wget 下载工具，请联系管理员安装或配置环境后重试！"
+            exit 1
+        fi
     fi
 }
 
@@ -263,45 +375,73 @@ ensure_nodejs() {
             log_info "检测到可用的 Node.js 运行环境: $(node -v)"
             return 0
         else
-            log_warn "当前 Node.js 版本过低 ($(node -v))，需要 Node.js 18+，正在自动升级..."
+            log_warn "当前 Node.js 版本过低 ($(node -v))，建议使用 Node.js 18+..."
             need_install=1
         fi
+    elif [[ -x "$APP_DIR/node/bin/node" ]]; then
+        log_info "检测到便携版 Node.js 运行环境: $("$APP_DIR/node/bin/node" -v)"
+        export PATH="$APP_DIR/node/bin:$PATH"
+        return 0
     else
         need_install=1
     fi
 
     if [[ "$need_install" -eq 1 ]]; then
-        log_info "正在自动安装 Node.js LTS 官方运行库..."
-        if command -v apk >/dev/null 2>&1; then
-            apk add --no-cache nodejs npm
-        elif command -v apt-get >/dev/null 2>&1; then
-            if command -v curl >/dev/null 2>&1; then
-                curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-            else
-                wget -qO- https://deb.nodesource.com/setup_20.x | bash -
+        if [[ "$IS_ROOT" -eq 1 ]]; then
+            log_info "正在自动安装 Node.js LTS 官方运行库..."
+            if command -v apk >/dev/null 2>&1; then
+                apk add --no-cache nodejs npm
+            elif command -v apt-get >/dev/null 2>&1; then
+                if command -v curl >/dev/null 2>&1; then
+                    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+                else
+                    wget -qO- https://deb.nodesource.com/setup_20.x | bash -
+                fi
+                apt-get install -y nodejs
+            elif command -v dnf >/dev/null 2>&1; then
+                if command -v curl >/dev/null 2>&1; then
+                    curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+                else
+                    wget -qO- https://rpm.nodesource.com/setup_20.x | bash -
+                fi
+                dnf install -y nodejs
+            elif command -v yum >/dev/null 2>&1; then
+                if command -v curl >/dev/null 2>&1; then
+                    curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+                else
+                    wget -qO- https://rpm.nodesource.com/setup_20.x | bash -
+                fi
+                yum install -y nodejs
             fi
-            apt-get install -y nodejs
-        elif command -v dnf >/dev/null 2>&1; then
-            if command -v curl >/dev/null 2>&1; then
-                curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
-            else
-                wget -qO- https://rpm.nodesource.com/setup_20.x | bash -
+        else
+            log_info "普通用户模式：正在自动下载便携版 Node.js 运行时至 ${APP_DIR}/node..."
+            local arch="x64"
+            local uarch
+            uarch=$(uname -m)
+            if [[ "$uarch" == "aarch64" || "$uarch" == "arm64" ]]; then
+                arch="arm64"
             fi
-            dnf install -y nodejs
-        elif command -v yum >/dev/null 2>&1; then
-            if command -v curl >/dev/null 2>&1; then
-                curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
-            else
-                wget -qO- https://rpm.nodesource.com/setup_20.x | bash -
+            local node_ver="v20.18.0"
+            local node_tar="node-${node_ver}-linux-${arch}.tar.xz"
+            local node_url="https://nodejs.org/dist/${node_ver}/${node_tar}"
+            mkdir -p "$APP_DIR/node"
+            fetch_file "$node_url" "$APP_DIR/${node_tar}" || {
+                log_error "下载 Node.js 便携包失败，请检查网络或手动安装 node 命令。"
+                return 1
+            }
+            tar -xf "$APP_DIR/${node_tar}" -C "$APP_DIR/node" --strip-components=1 2>/dev/null || true
+            rm -f "$APP_DIR/${node_tar}"
+            if [[ -x "$APP_DIR/node/bin/node" ]]; then
+                log_info "便携版 Node.js 安装成功: $("$APP_DIR/node/bin/node" -v)"
+                export PATH="$APP_DIR/node/bin:$PATH"
             fi
-            yum install -y nodejs
         fi
 
-        if ! command -v node >/dev/null 2>&1; then
-            log_error "Node.js 自动安装失败，请手动安装 Node.js 18+ 后重新运行脚本！"
+        if ! command -v node >/dev/null 2>&1 && [[ ! -x "$APP_DIR/node/bin/node" ]]; then
+            log_error "Node.js 运行环境不可用，请确保 node 命令可用后重新运行脚本！"
             exit 1
         fi
-        log_info "Node.js 安装成功: $(node -v)"
+        log_info "Node.js 运行环境就绪。"
     fi
 }
 
@@ -455,6 +595,12 @@ get_bbr_status() {
 }
 
 manage_bbr() {
+    if [[ "$IS_ROOT" -eq 0 ]]; then
+        log_warn "修改系统 TCP BBR 参数需要 root 权限，当前为普通用户模式，跳过执行。"
+        echo -e "\n按任意键返回..."
+        read -n 1 -s -r
+        return 0
+    fi
     echo -e "\n${CYAN}================= 🚀 TCP BBR 拥塞控制管理 ================${NC}"
     local cur_cc
     cur_cc=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)
@@ -671,21 +817,26 @@ deploy_core() {
 
     log_info "正在安装 Node.js 依赖..."
     cd "$APP_DIR/nodejs" || exit 1
-    npm install --omit=dev --silent
+    local npm_bin="npm"
+    if [[ -x "$APP_DIR/node/bin/npm" ]]; then
+        npm_bin="$APP_DIR/node/bin/npm"
+    fi
+    "$npm_bin" install --omit=dev --silent 2>/dev/null || npm install --omit=dev --silent 2>/dev/null || true
 
     # 下载最新实体脚本并更新全局快捷命令 (同时支持 argo 与短命令 ag)
+    ensure_bin_path
     fetch_file "${REPO_RAW}/argo.sh" "$APP_DIR/argo.sh" || true
     chmod +x "$APP_DIR/argo.sh" 2>/dev/null || true
     ln -sf "$APP_DIR/argo.sh" "$BIN_LINK" 2>/dev/null || true
     chmod +x "$BIN_LINK" 2>/dev/null || true
-    ln -sf "$APP_DIR/argo.sh" "/usr/local/bin/ag" 2>/dev/null || true
-    chmod +x "/usr/local/bin/ag" 2>/dev/null || true
+    ln -sf "$APP_DIR/argo.sh" "$BIN_LINK_AG" 2>/dev/null || true
+    chmod +x "$BIN_LINK_AG" 2>/dev/null || true
 }
 
 # ── 注册系统守护服务 (支持 Systemd 与 OpenRC) ─────────────────────────────────
 install_service() {
     local node_bin
-    node_bin=$(command -v node)
+    node_bin=$(find_node_bin)
 
     if [[ "$INIT_TYPE" == "systemd" ]]; then
         log_info "正在注册 systemd 系统守护服务 (${SVC_NAME})..."
@@ -712,6 +863,32 @@ EOF
         systemctl enable "$SVC_NAME" >/dev/null 2>&1
         systemctl restart "$SVC_NAME"
         log_info "Argo 服务已启动并设置开机自启！"
+    elif [[ "$INIT_TYPE" == "systemd_user" ]]; then
+        log_info "正在注册 systemd 用户守护服务 (${SVC_NAME})..."
+        mkdir -p "${HOME}/.config/systemd/user"
+        cat > "$SVC_SYSTEMD" <<EOF
+[Unit]
+Description=Argo Zero-Binary Proxy Service (User Mode)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=${APP_DIR}/nodejs
+EnvironmentFile=-${ENV_FILE}
+ExecStart=${node_bin} index.js
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=65535
+
+[Install]
+WantedBy=default.target
+EOF
+
+        systemctl --user daemon-reload
+        systemctl --user enable "$SVC_NAME" >/dev/null 2>&1
+        systemctl --user restart "$SVC_NAME"
+        loginctl enable-linger "$USER" >/dev/null 2>&1 || true
+        log_info "Argo 用户服务已启动并设置开机/登录自启！"
     elif [[ "$INIT_TYPE" == "openrc" ]]; then
         log_info "正在注册 OpenRC 系统守护服务 (${SVC_NAME})..."
         cat > "$SVC_OPENRC" <<EOF
@@ -746,6 +923,19 @@ EOF
         rc-service "$SVC_NAME" stop >/dev/null 2>&1 || true
         rc-service "$SVC_NAME" start
         log_info "Argo 服务已通过 OpenRC 启动并设置开机自启！"
+    elif [[ "$INIT_TYPE" == "nohup_cron" ]]; then
+        log_info "正在启动 Argo 后台进程并配置 Crontab 自愈守护..."
+        svc_restart
+        local current_cron
+        current_cron=$(crontab -l 2>/dev/null || true)
+        local cron_job_reboot="@reboot ${BIN_LINK} start >/dev/null 2>&1"
+        local cron_job_watchdog="*/5 * * * * ${BIN_LINK} status >/dev/null 2>&1 || ${BIN_LINK} start >/dev/null 2>&1"
+        local new_cron="$current_cron"
+        if ! echo "$new_cron" | grep -Fq "${BIN_LINK} start"; then
+            new_cron=$(printf "%s\n%s\n%s\n" "$new_cron" "$cron_job_reboot" "$cron_job_watchdog" | sed '/^$/d')
+            echo "$new_cron" | crontab - 2>/dev/null || log_warn "未能自动写入 crontab，请手动设置定时任务保活。"
+            log_info "已成功向当前用户 Crontab 注入开机自启与 5 分钟故障自愈保活！"
+        fi
     fi
 }
 
@@ -770,8 +960,10 @@ check_status() {
 extract_temp_domain() {
     if [[ "$INIT_TYPE" == "systemd" ]]; then
         journalctl -u "$SVC_NAME" --no-pager -n 50 2>/dev/null | grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' | tail -1
+    elif [[ "$INIT_TYPE" == "systemd_user" ]]; then
+        journalctl --user -u "$SVC_NAME" --no-pager -n 50 2>/dev/null | grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' | tail -1
     else
-        grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$OPENRC_LOG" 2>/dev/null | tail -1
+        grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$LOG_FILE" 2>/dev/null | tail -1
     fi
 }
 
@@ -819,6 +1011,11 @@ show_subscription() {
     else
         echo -e "${YELLOW}服务已启动，隧道建立中，请稍后输入 argo sub 查询最新域名。${NC}"
     fi
+
+    if [[ -z "$fixed_domain" ]]; then
+        echo -e "\n${YELLOW}提示: 当前为临时隧道，已自动启用标准稳定 WebSocket 节点 (VLESS-WS / Trojan-WS)。${NC}"
+        echo -e "${YELLOW}      XHTTP 协议需要绑定固定隧道与自有域名，配置固定隧道 (ARGO_DOMAIN) 后重启将自动激活。${NC}"
+    fi
     echo -e "${CYAN}========================================================${NC}\n"
 }
 
@@ -827,9 +1024,11 @@ view_logs() {
     echo -e "${YELLOW}按 Ctrl+C 退出实时日志查看...${NC}\n"
     if [[ "$INIT_TYPE" == "systemd" ]]; then
         journalctl -u "$SVC_NAME" -f -n 50
+    elif [[ "$INIT_TYPE" == "systemd_user" ]]; then
+        journalctl --user -u "$SVC_NAME" -f -n 50
     else
-        touch "$OPENRC_LOG"
-        tail -f -n 50 "$OPENRC_LOG"
+        touch "$LOG_FILE"
+        tail -f -n 50 "$LOG_FILE"
     fi
 }
 
@@ -856,27 +1055,37 @@ uninstall_argo() {
     fi
 
     log_info "正在停止并清理 Argo 服务..."
+    svc_stop
     if [[ "$INIT_TYPE" == "systemd" ]]; then
-        systemctl stop "$SVC_NAME" >/dev/null 2>&1
-        systemctl disable "$SVC_NAME" >/dev/null 2>&1
+        systemctl disable "$SVC_NAME" >/dev/null 2>&1 || true
         rm -f "$SVC_SYSTEMD"
-        systemctl daemon-reload
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    elif [[ "$INIT_TYPE" == "systemd_user" ]]; then
+        systemctl --user disable "$SVC_NAME" >/dev/null 2>&1 || true
+        rm -f "$SVC_SYSTEMD"
+        systemctl --user daemon-reload >/dev/null 2>&1 || true
     elif [[ "$INIT_TYPE" == "openrc" ]]; then
-        rc-service "$SVC_NAME" stop >/dev/null 2>&1 || true
         rc-update del "$SVC_NAME" default >/dev/null 2>&1 || true
         rm -f "$SVC_OPENRC"
         rm -f /run/argo.pid
         rm -f "$OPENRC_LOG"
+    elif [[ "$INIT_TYPE" == "nohup_cron" ]]; then
+        local current_cron
+        current_cron=$(crontab -l 2>/dev/null | grep -v "${BIN_LINK}" || true)
+        if [[ -n "$current_cron" ]]; then
+            echo "$current_cron" | crontab - 2>/dev/null || true
+        else
+            crontab -r 2>/dev/null || true
+        fi
     fi
 
-    pkill -f "bridge" 2>/dev/null || true
-    pkill -f "metrics" 2>/dev/null || true
-    pkill -f "node /app/bridge.js" 2>/dev/null || true
-    pkill -f "node index.js" 2>/dev/null || true
+    pkill -u "$(id -u)" -f "bridge" 2>/dev/null || true
+    pkill -u "$(id -u)" -f "metrics" 2>/dev/null || true
+    pkill -u "$(id -u)" -f "node /app/bridge.js" 2>/dev/null || true
+    pkill -u "$(id -u)" -f "node index.js" 2>/dev/null || true
 
     rm -rf "$APP_DIR"
-    rm -f "$BIN_LINK"
-    rm -f "/usr/local/bin/ag" 2>/dev/null || true
+    rm -f "$BIN_LINK" "$BIN_LINK_AG"
     rm -rf "$HOME/.argo-core"
 
     # 若残留 NAT64 注入，一并清理复原
@@ -915,21 +1124,17 @@ main_menu() {
             do_install
             ;;
         2)
-            check_root
             uninstall_argo
             ;;
         3)
-            check_root
             svc_start
             log_info "服务已启动。"
             ;;
         4)
-            check_root
             svc_stop
             log_info "服务已停止。"
             ;;
         5)
-            check_root
             svc_restart
             log_info "服务已重启。"
             ;;
@@ -940,17 +1145,18 @@ main_menu() {
             view_logs
             ;;
         8)
-            check_root
             config_menu
             ;;
         9)
-            check_root
             nat64_enable_temp
             log_info "正在从 GitHub 拉取最新脚本与服务端核心..."
             fetch_file "${REPO_RAW}/argo.sh" "$APP_DIR/argo.sh" || true
             chmod +x "$APP_DIR/argo.sh" 2>/dev/null || true
+            ensure_bin_path
             ln -sf "$APP_DIR/argo.sh" "$BIN_LINK" 2>/dev/null || true
-            ln -sf "$APP_DIR/argo.sh" "/usr/local/bin/ag" 2>/dev/null || true
+            chmod +x "$BIN_LINK" 2>/dev/null || true
+            ln -sf "$APP_DIR/argo.sh" "$BIN_LINK_AG" 2>/dev/null || true
+            chmod +x "$BIN_LINK_AG" 2>/dev/null || true
             deploy_core
             svc_restart >/dev/null 2>&1 || true
             log_info "Argo 脚本与核心已成功更新至最新版本！"
@@ -995,6 +1201,7 @@ check_init_system
 init_shortcut() {
     nat64_enable_temp
     mkdir -p "$APP_DIR"
+    ensure_bin_path
     if [[ ! -s "$APP_DIR/argo.sh" || "$0" == /dev/fd/* || "$0" == /proc/* ]]; then
         fetch_file "${REPO_RAW}/argo.sh" "$APP_DIR/argo.sh" || true
         chmod +x "$APP_DIR/argo.sh" 2>/dev/null || true
@@ -1002,8 +1209,8 @@ init_shortcut() {
     if [[ -s "$APP_DIR/argo.sh" ]]; then
         ln -sf "$APP_DIR/argo.sh" "$BIN_LINK" 2>/dev/null || true
         chmod +x "$BIN_LINK" 2>/dev/null || true
-        ln -sf "$APP_DIR/argo.sh" "/usr/local/bin/ag" 2>/dev/null || true
-        chmod +x "/usr/local/bin/ag" 2>/dev/null || true
+        ln -sf "$APP_DIR/argo.sh" "$BIN_LINK_AG" 2>/dev/null || true
+        chmod +x "$BIN_LINK_AG" 2>/dev/null || true
     fi
 }
 init_shortcut
@@ -1031,8 +1238,11 @@ if [[ -n "$1" ]]; then
             log_info "正在拉取最新代码更新..."
             fetch_file "${REPO_RAW}/argo.sh" "$APP_DIR/argo.sh" || true
             chmod +x "$APP_DIR/argo.sh" 2>/dev/null || true
+            ensure_bin_path
             ln -sf "$APP_DIR/argo.sh" "$BIN_LINK" 2>/dev/null || true
-            ln -sf "$APP_DIR/argo.sh" "/usr/local/bin/ag" 2>/dev/null || true
+            chmod +x "$BIN_LINK" 2>/dev/null || true
+            ln -sf "$APP_DIR/argo.sh" "$BIN_LINK_AG" 2>/dev/null || true
+            chmod +x "$BIN_LINK_AG" 2>/dev/null || true
             deploy_core
             svc_restart >/dev/null 2>&1 || true
             log_info "Argo 已更新至最新版本并重启！"

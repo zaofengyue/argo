@@ -294,13 +294,19 @@ function parseTrojanHeader(buffer) {
   };
 }
 
-// ── 节点链接生成器（原生高能 4 组合，名称仅 国家+运营商）───────────────────
+// ── 节点链接生成器（原生高能组合，名称仅 国家+运营商）───────────────────
 function generateNodeLinks(host, preferHost) {
   const remark = encodeURIComponent(NODE_NAME || 'argo');
-  const vlessXhttp  = `vless://${UUID}@${preferHost}:443?encryption=none&security=tls&type=xhttp&host=${host}&path=${encodeURIComponent(PATH_XHTTP)}&mode=packet-up&sni=${host}#${remark}`;
   const vlessWs     = `vless://${UUID}@${preferHost}:443?encryption=none&security=tls&type=ws&host=${host}&path=${encodeURIComponent(PATH_VLESS)}&sni=${host}#${remark}`;
-  const trojanXhttp = `trojan://${PASSWORD}@${preferHost}:443?security=tls&type=xhttp&host=${host}&path=${encodeURIComponent(PATH_TROJAN_XHTTP)}&mode=packet-up&sni=${host}#${remark}`;
   const trojanWs    = `trojan://${PASSWORD}@${preferHost}:443?security=tls&type=ws&host=${host}&path=${encodeURIComponent(PATH_TROJAN)}&sni=${host}#${remark}`;
+
+  // XHTTP (SplitHTTP) 仅在配置固定隧道 (ARGO_DOMAIN) 时激活生成
+  if (!ARGO_DOMAIN) {
+    return [vlessWs, trojanWs];
+  }
+
+  const vlessXhttp  = `vless://${UUID}@${preferHost}:443?encryption=none&security=tls&type=xhttp&host=${host}&path=${encodeURIComponent(PATH_XHTTP)}&mode=packet-up&sni=${host}#${remark}`;
+  const trojanXhttp = `trojan://${PASSWORD}@${preferHost}:443?security=tls&type=xhttp&host=${host}&path=${encodeURIComponent(PATH_TROJAN_XHTTP)}&mode=packet-up&sni=${host}#${remark}`;
 
   return [vlessXhttp, vlessWs, trojanXhttp, trojanWs];
 }
@@ -493,130 +499,133 @@ const server = http.createServer((req, res) => {
   const pathParts = reqUrl.split('/').filter(Boolean);
   const rootSegment = '/' + (pathParts[0] || '');
 
-  // ② VLESS + xhttp (SplitHTTP) - 支持 packet-up 会话多路复用与 stream-one 单流
-  if (rootSegment === PATH_XHTTP) {
-    if (pathParts.length > 1) {
-      return handleXhttpSession(req, res, pathParts, 'vless');
-    }
-    if (req.method === 'POST') {
-      let isParsed = false;
-      let remoteSocket = null;
-      const chunksQueue = [];
+  // ② XHTTP (SplitHTTP) - 仅在配置固定隧道 (ARGO_DOMAIN) 时激活路由
+  if (ARGO_DOMAIN) {
+    // VLESS + xhttp
+    if (rootSegment === PATH_XHTTP) {
+      if (pathParts.length > 1) {
+        return handleXhttpSession(req, res, pathParts, 'vless');
+      }
+      if (req.method === 'POST') {
+        let isParsed = false;
+        let remoteSocket = null;
+        const chunksQueue = [];
 
-      req.on('data', (chunk) => {
-        if (!isParsed) {
-          chunksQueue.push(chunk);
-          const fullBuf = Buffer.concat(chunksQueue);
+        req.on('data', (chunk) => {
+          if (!isParsed) {
+            chunksQueue.push(chunk);
+            const fullBuf = Buffer.concat(chunksQueue);
 
-          if (fullBuf.length > 2048) {
+            if (fullBuf.length > 2048) {
+              res.writeHead(400, { 'Content-Type': 'text/plain' });
+              res.end('Bad Request');
+              req.destroy();
+              return;
+            }
+
+            const parsed = parseVlessHeader(fullBuf);
+            if (parsed) {
+              isParsed = true;
+              remoteSocket = net.connect({ host: parsed.targetHost, port: parsed.targetPort }, () => {
+                res.writeHead(200, {
+                  'Content-Type': 'application/octet-stream',
+                  'Transfer-Encoding': 'chunked',
+                  'Cache-Control': 'no-cache, no-store',
+                  'Connection': 'keep-alive'
+                });
+                res.write(Buffer.from([0, 0])); // VLESS 握手响应
+                if (parsed.payload.length > 0) remoteSocket.write(parsed.payload);
+
+                remoteSocket.on('data', (d) => {
+                  if (!res.write(d)) {
+                    remoteSocket.pause();
+                  }
+                });
+                res.on('drain', () => remoteSocket.resume());
+                remoteSocket.on('close', () => res.end());
+                remoteSocket.on('error', () => res.end());
+              });
+              remoteSocket.on('error', () => res.destroy());
+            }
+          } else {
+            if (remoteSocket && !remoteSocket.destroyed) remoteSocket.write(chunk);
+          }
+        });
+
+        req.on('end', () => {
+          if (!isParsed) {
             res.writeHead(400, { 'Content-Type': 'text/plain' });
             res.end('Bad Request');
-            req.destroy();
-            return;
+          } else if (remoteSocket && !remoteSocket.destroyed) {
+            remoteSocket.end();
           }
+        });
+        req.on('error', () => { if (remoteSocket) remoteSocket.destroy(); });
+        return;
+      }
+    }
 
-          const parsed = parseVlessHeader(fullBuf);
-          if (parsed) {
-            isParsed = true;
-            remoteSocket = net.connect({ host: parsed.targetHost, port: parsed.targetPort }, () => {
-              res.writeHead(200, {
-                'Content-Type': 'application/octet-stream',
-                'Transfer-Encoding': 'chunked',
-                'Cache-Control': 'no-cache, no-store',
-                'Connection': 'keep-alive'
-              });
-              res.write(Buffer.from([0, 0])); // VLESS 握手响应
-              if (parsed.payload.length > 0) remoteSocket.write(parsed.payload);
+    // Trojan + xhttp
+    if (rootSegment === PATH_TROJAN_XHTTP) {
+      if (pathParts.length > 1) {
+        return handleXhttpSession(req, res, pathParts, 'trojan');
+      }
+      if (req.method === 'POST') {
+        let isParsed = false;
+        let remoteSocket = null;
+        const chunksQueue = [];
 
-              remoteSocket.on('data', (d) => {
-                if (!res.write(d)) {
-                  remoteSocket.pause();
-                }
+        req.on('data', (chunk) => {
+          if (!isParsed) {
+            chunksQueue.push(chunk);
+            const fullBuf = Buffer.concat(chunksQueue);
+
+            if (fullBuf.length > 2048) {
+              res.writeHead(400, { 'Content-Type': 'text/plain' });
+              res.end('Bad Request');
+              req.destroy();
+              return;
+            }
+
+            const parsed = parseTrojanHeader(fullBuf);
+            if (parsed) {
+              isParsed = true;
+              remoteSocket = net.connect({ host: parsed.targetHost, port: parsed.targetPort }, () => {
+                res.writeHead(200, {
+                  'Content-Type': 'application/octet-stream',
+                  'Transfer-Encoding': 'chunked',
+                  'Cache-Control': 'no-cache, no-store',
+                  'Connection': 'keep-alive'
+                });
+                if (parsed.payload.length > 0) remoteSocket.write(parsed.payload);
+
+                remoteSocket.on('data', (d) => {
+                  if (!res.write(d)) {
+                    remoteSocket.pause();
+                  }
+                });
+                res.on('drain', () => remoteSocket.resume());
+                remoteSocket.on('close', () => res.end());
+                remoteSocket.on('error', () => res.end());
               });
-              res.on('drain', () => remoteSocket.resume());
-              remoteSocket.on('close', () => res.end());
-              remoteSocket.on('error', () => res.end());
-            });
-            remoteSocket.on('error', () => res.destroy());
+              remoteSocket.on('error', () => res.destroy());
+            }
+          } else {
+            if (remoteSocket && !remoteSocket.destroyed) remoteSocket.write(chunk);
           }
-        } else {
-          if (remoteSocket && !remoteSocket.destroyed) remoteSocket.write(chunk);
-        }
-      });
+        });
 
-      req.on('end', () => {
-        if (!isParsed) {
-          res.writeHead(400, { 'Content-Type': 'text/plain' });
-          res.end('Bad Request');
-        } else if (remoteSocket && !remoteSocket.destroyed) {
-          remoteSocket.end();
-        }
-      });
-      req.on('error', () => { if (remoteSocket) remoteSocket.destroy(); });
-      return;
-    }
-  }
-
-  // ③ Trojan + xhttp (SplitHTTP) - 支持 packet-up 会话多路复用与 stream-one 单流
-  if (rootSegment === PATH_TROJAN_XHTTP) {
-    if (pathParts.length > 1) {
-      return handleXhttpSession(req, res, pathParts, 'trojan');
-    }
-    if (req.method === 'POST') {
-      let isParsed = false;
-      let remoteSocket = null;
-      const chunksQueue = [];
-
-      req.on('data', (chunk) => {
-        if (!isParsed) {
-          chunksQueue.push(chunk);
-          const fullBuf = Buffer.concat(chunksQueue);
-
-          if (fullBuf.length > 2048) {
+        req.on('end', () => {
+          if (!isParsed) {
             res.writeHead(400, { 'Content-Type': 'text/plain' });
             res.end('Bad Request');
-            req.destroy();
-            return;
+          } else if (remoteSocket && !remoteSocket.destroyed) {
+            remoteSocket.end();
           }
-
-          const parsed = parseTrojanHeader(fullBuf);
-          if (parsed) {
-            isParsed = true;
-            remoteSocket = net.connect({ host: parsed.targetHost, port: parsed.targetPort }, () => {
-              res.writeHead(200, {
-                'Content-Type': 'application/octet-stream',
-                'Transfer-Encoding': 'chunked',
-                'Cache-Control': 'no-cache, no-store',
-                'Connection': 'keep-alive'
-              });
-              if (parsed.payload.length > 0) remoteSocket.write(parsed.payload);
-
-              remoteSocket.on('data', (d) => {
-                if (!res.write(d)) {
-                  remoteSocket.pause();
-                }
-              });
-              res.on('drain', () => remoteSocket.resume());
-              remoteSocket.on('close', () => res.end());
-              remoteSocket.on('error', () => res.end());
-            });
-            remoteSocket.on('error', () => res.destroy());
-          }
-        } else {
-          if (remoteSocket && !remoteSocket.destroyed) remoteSocket.write(chunk);
-        }
-      });
-
-      req.on('end', () => {
-        if (!isParsed) {
-          res.writeHead(400, { 'Content-Type': 'text/plain' });
-          res.end('Bad Request');
-        } else if (remoteSocket && !remoteSocket.destroyed) {
-          remoteSocket.end();
-        }
-      });
-      req.on('error', () => { if (remoteSocket) remoteSocket.destroy(); });
-      return;
+        });
+        req.on('error', () => { if (remoteSocket) remoteSocket.destroy(); });
+        return;
+      }
     }
   }
 
