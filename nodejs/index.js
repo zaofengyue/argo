@@ -136,7 +136,8 @@ process.on('unhandledRejection', (reason) => {
 
 // ── 预编译鉴权哈希缓存 ────────────────────────────────────────────────────────
 const UUID_BUF = Buffer.from(UUID.replace(/-/g, ''), 'hex');
-const TROJAN_HASH_STR = crypto.createHash('sha224').update(PASSWORD).digest('hex');
+const TROJAN_HASH_STR = crypto.createHash('sha224').update(PASSWORD).digest('hex').toLowerCase();
+const TROJAN_HASH_BUF = Buffer.from(TROJAN_HASH_STR, 'utf8');
 
 // ── 读取伪装网页 ─────────────────────────────────────────────────────────────
 const HTML_FILE = path.join(__dirname, 'index.html');
@@ -182,11 +183,17 @@ async function resolveNodeName() {
     const country    = normalizeCountry(countryRaw);
     const org        = normalizeOrg(orgRaw);
     NODE_NAME = country && org ? `${country}-${org}` : country ? `${country}-argo` : 'argo';
+    if (NODE_NAME && NODE_NAME !== 'argo') {
+      console.log(`[节点标识] 归属地与运营商已识别: ${NODE_NAME}`);
+    }
   } catch {
     NODE_NAME = 'argo';
   }
   return NODE_NAME;
 }
+
+// 异步后台探测，绝不阻塞服务与穿透隧道的启动
+const nodeNamePromise = resolveNodeName();
 
 // ── 容器在线时长虚拟化（对标当前容器启动时刻，解决探针显示几百天问题）───────
 function setupContainerUptime() {
@@ -207,11 +214,12 @@ function setupContainerUptime() {
   } catch {}
 }
 
-// ── VLESS 二进制报文解析器（严格越界保护）─────────────────────────────────────
+// ── VLESS 二进制报文解析器（严格越界保护与恒定时间防时序攻击）─────────────────
 function parseVlessHeader(buffer) {
   if (!Buffer.isBuffer(buffer) || buffer.length < 24) return null;
   if (buffer.readUInt8(0) !== 0) return null;
-  if (!buffer.slice(1, 17).equals(UUID_BUF)) return null;
+  const clientUuid = buffer.slice(1, 17);
+  if (clientUuid.length !== 16 || !crypto.timingSafeEqual(clientUuid, UUID_BUF)) return null;
 
   let cursor = 17;
   const optLength = buffer.readUInt8(cursor);
@@ -258,11 +266,11 @@ function parseVlessHeader(buffer) {
   };
 }
 
-// ── Trojan 二进制报文解析器（严格越界保护）───────────────────────────────────
+// ── Trojan 二进制报文解析器（严格越界保护与恒定时间防时序攻击）───────────────
 function parseTrojanHeader(buffer) {
   if (!Buffer.isBuffer(buffer) || buffer.length < 62) return null;
-  const reqHash = buffer.slice(0, 56).toString('utf8');
-  if (reqHash.toLowerCase() !== TROJAN_HASH_STR) return null;
+  const reqHash = Buffer.from(buffer.slice(0, 56).toString('utf8').toLowerCase(), 'utf8');
+  if (reqHash.length !== 56 || !crypto.timingSafeEqual(reqHash, TROJAN_HASH_BUF)) return null;
   if (buffer[56] !== 0x0d || buffer[57] !== 0x0a) return null;
   if (buffer[58] !== 1) return null; // 仅代理 TCP 流
 
@@ -320,7 +328,7 @@ function generateNodeLinks(host, preferHost) {
 }
 
 // ── 出站安全阻断名单 (基于 DNS 解析与网段判定，防 SSRF、回环及云厂商元数据劫持) ─
-const ALLOW_LAN = process.env.ALLOW_LAN === 'true';
+const ALLOW_LAN = ['true', '1', 'yes'].includes((process.env.ALLOW_LAN || '').trim().toLowerCase());
 const blockList = new net.BlockList();
 
 // 1. 本机回环、未指定与广播
@@ -1415,6 +1423,31 @@ async function startArgoTunnel(localPort) {
     CURRENT_ARGO_HOST = ARGO_DOMAIN;
     const cfEnv = { ...process.env, TUNNEL_TOKEN: ARGO_AUTH };
 
+    let notified = false;
+    let fallbackTimer = null;
+
+    const triggerSuccess = async () => {
+      if (notified) return;
+      notified = true;
+      if (fallbackTimer) {
+        clearTimeout(fallbackTimer);
+        fallbackTimer = null;
+      }
+      if (nodeNamePromise) {
+        try { await nodeNamePromise; } catch {}
+      }
+      displayNodeInfo(CURRENT_ARGO_HOST);
+      notifyTelegram(CURRENT_ARGO_HOST);
+    };
+
+    // 30 秒超时托底保护（若 Cloudflare 输出格式变更或网络延迟，仍可输出配置）
+    fallbackTimer = setTimeout(() => {
+      if (!notified) {
+        console.warn('[Argo固定隧道] 等待云端注册信号超时 (30s)，先行呈现配置（请检查 Token 与网络状态）');
+        triggerSuccess();
+      }
+    }, 30000);
+
     superviseProcess('Argo固定隧道', () => {
       const proc = spawn(cfBin, args, {
         ...spawnOpts,
@@ -1431,19 +1464,15 @@ async function startArgoTunnel(localPort) {
             if (!connLogged) {
               connLogged = true;
               console.log('[Argo固定隧道] 云端连接已就绪并注册成功');
+              triggerSuccess();
             }
-          } else if (/(ERR|error|fail|refused|unable|panic|fatal)/i.test(line)) {
+          } else if (!/(\bINF\b|hard_fail=false)/i && /(ERR|error|\bfail(ed|ure)?\b|refused|unable|panic|fatal)/i.test(line)) {
             console.error(`[Argo固定隧道异常] ${line}`);
           }
         }
       });
       return proc;
     });
-
-    setTimeout(() => {
-      displayNodeInfo(CURRENT_ARGO_HOST);
-      notifyTelegram(CURRENT_ARGO_HOST);
-    }, 3000);
   } else {
     console.log(`[Argo] 正在向 Cloudflare 申请临时穿透域名... (协议: ${ARGO_PROTOCOL || 'auto'})`);
     args.push('--url', `http://127.0.0.1:${localPort}`);
@@ -1455,14 +1484,19 @@ async function startArgoTunnel(localPort) {
         const match = text.match(/https:\/\/(?!api\.)([a-z0-9-]+\.trycloudflare\.com)/);
         if (match && match[1] && match[1] !== CURRENT_ARGO_HOST) {
           CURRENT_ARGO_HOST = match[1];
-          displayNodeInfo(CURRENT_ARGO_HOST);
-          notifyTelegram(CURRENT_ARGO_HOST);
+          (async () => {
+            if (nodeNamePromise) {
+              try { await nodeNamePromise; } catch {}
+            }
+            displayNodeInfo(CURRENT_ARGO_HOST);
+            notifyTelegram(CURRENT_ARGO_HOST);
+          })();
         }
         const lines = text.split('\n');
         for (const rawLine of lines) {
           const line = rawLine.trim();
           if (!line) continue;
-          if (/(ERR|error|fail|refused|unable|panic|fatal)/i.test(line)) {
+          if (!/(\bINF\b|hard_fail=false)/i && /(ERR|error|\bfail(ed|ure)?\b|refused|unable|panic|fatal)/i.test(line)) {
             console.error(`[Argo临时隧道异常] ${line}`);
           }
         }
@@ -1504,14 +1538,14 @@ killStaleByTag();
 
 const isDualStack = !LISTEN_HOST || LISTEN_HOST === '0.0.0.0' || LISTEN_HOST === '::' || LISTEN_HOST === '127.0.0.1' || LISTEN_HOST === 'localhost';
 
-const onListening = async () => {
-  await resolveNodeName();
-
+const onListening = () => {
   const listenAddr = isDualStack ? '0.0.0.0 / [::]' : HOST;
   console.log(`====================================================`);
   console.log(`🚀 Argo (Zero-Binary 纯原生穿透引擎) 已启动`);
   console.log(`📡 内部监听: ${listenAddr}:${PORT} (双栈兼容 localhost/127.0.0.1)`);
-  console.log(`🏷️  节点标识: ${NODE_NAME}`);
+  if (NODE_NAME) {
+    console.log(`🏷️  节点标识: ${NODE_NAME}`);
+  }
   console.log(`🔑 核心 UUID: ${UUID}`);
   console.log(`🔒 独立密码: ${PASSWORD}`);
   console.log(`💾 内存占用: ${(process.memoryUsage().rss / 1024 / 1024).toFixed(2)} MB`);

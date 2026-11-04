@@ -1,4 +1,4 @@
-FROM node:20-alpine
+FROM node:22-alpine
 
 ARG TARGETARCH
 
@@ -38,7 +38,7 @@ ENV LISTEN_HOST=0.0.0.0
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD curl -fs http://127.0.0.1:3000/ || exit 1
+  CMD curl -fs "http://127.0.0.1:${PORT:-3000}/" || exit 1
 
 ENTRYPOINT ["/sbin/tini", "--"]
 

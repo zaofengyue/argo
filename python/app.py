@@ -8,6 +8,7 @@ import re
 import time
 import base64
 import hashlib
+import hmac
 import asyncio
 import platform
 import subprocess
@@ -82,6 +83,7 @@ PATH_TROJAN       = '/trojan-ws'
 tracked_processes = []
 is_shutting_down = False
 CURRENT_ARGO_HOST = ARGO_DOMAIN or 'your-domain.com'
+node_name_task = None
 
 HOME_DIR = Path.home()
 CORE_DIR = HOME_DIR / '.argo-core'
@@ -198,6 +200,8 @@ async def resolve_node_name() -> str:
         c = normalize_country(country_raw)
         o = normalize_org(org_raw)
         NODE_NAME = f"{c}-{o}" if (c and o) else (f"{c}-argo" if c else "argo")
+        if NODE_NAME and NODE_NAME != "argo":
+            print(f"[节点标识] 归属地与运营商已识别: {NODE_NAME}")
     except Exception:
         NODE_NAME = "argo"
     return NODE_NAME
@@ -220,13 +224,13 @@ async def setup_container_uptime():
     except Exception:
         pass
 
-# ── VLESS 二进制报文解析器（严格越界保护）─────────────────────────────────────
+# ── VLESS 二进制报文解析器（严格越界保护与恒定时间防时序攻击）─────────────────
 def parse_vless_header(buf: bytes):
     if not isinstance(buf, (bytes, bytearray)) or len(buf) < 24:
         return None
     if buf[0] != 0:
         return None
-    if buf[1:17] != UUID_BYTES:
+    if len(buf) < 17 or not hmac.compare_digest(buf[1:17], UUID_BYTES):
         return None
 
     cursor = 17
@@ -277,12 +281,12 @@ def parse_vless_header(buf: bytes):
         'payload': buf[cursor:]
     }
 
-# ── Trojan 二进制报文解析器（严格越界保护）───────────────────────────────────
+# ── Trojan 二进制报文解析器（严格越界保护与恒定时间防时序攻击）───────────────
 def parse_trojan_header(buf: bytes):
     if not isinstance(buf, (bytes, bytearray)) or len(buf) < 62:
         return None
     req_hash = buf[:56].decode('utf-8', errors='ignore').lower()
-    if req_hash != TROJAN_HASH_STR:
+    if not hmac.compare_digest(req_hash, TROJAN_HASH_STR):
         return None
     if buf[56] != 0x0D or buf[57] != 0x0A:
         return None
@@ -600,6 +604,36 @@ async def start_argo_tunnel(local_port: int):
         env = os.environ.copy()
         env['TUNNEL_TOKEN'] = ARGO_AUTH
 
+        notified = False
+        fallback_task = None
+
+        async def trigger_success():
+            nonlocal notified, fallback_task
+            if notified:
+                return
+            notified = True
+            if fallback_task and not fallback_task.done():
+                fallback_task.cancel()
+            global node_name_task
+            if node_name_task and not node_name_task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(node_name_task), timeout=5.0)
+                except Exception:
+                    pass
+            display_node_info(CURRENT_ARGO_HOST)
+            await notify_telegram(CURRENT_ARGO_HOST)
+
+        async def fallback_timer():
+            try:
+                await asyncio.sleep(30)
+                if not notified:
+                    print("[Argo固定隧道] 等待云端注册信号超时 (30s)，先行呈现配置（请检查 Token 与网络状态）", file=sys.stderr)
+                    await trigger_success()
+            except asyncio.CancelledError:
+                pass
+
+        fallback_task = asyncio.create_task(fallback_timer())
+
         async def spawn_fixed():
             proc = await asyncio.create_subprocess_exec(
                 str(cf_bin), *fixed_args,
@@ -621,17 +655,14 @@ async def start_argo_tunnel(local_port: int):
                         if not conn_logged:
                             conn_logged = True
                             print("[Argo固定隧道] 云端连接已就绪并注册成功")
-                    elif re.search(r'(ERR|error|fail|refused|unable|panic|fatal)', line_str, re.I):
+                            await trigger_success()
+                    elif not re.search(r'(\bINF\b|hard_fail=false)', line_str, re.I) and re.search(r'(ERR|error|\bfail(ed|ure)?\b|refused|unable|panic|fatal)', line_str, re.I):
                         print(f"[Argo固定隧道异常] {line_str}", file=sys.stderr)
 
             asyncio.create_task(monitor_fixed_stderr())
             return proc
 
         asyncio.create_task(supervise_process('Argo固定隧道', spawn_fixed))
-
-        await asyncio.sleep(3)
-        display_node_info(CURRENT_ARGO_HOST)
-        await notify_telegram(CURRENT_ARGO_HOST)
     else:
         print(f"[Argo] 正在向 Cloudflare 申请临时穿透域名... (协议: {ARGO_PROTOCOL or 'auto'})")
         temp_args = list(args) + ['--url', f"http://127.0.0.1:{local_port}"]
@@ -657,9 +688,15 @@ async def start_argo_tunnel(local_port: int):
                         new_host = match.group(1)
                         if new_host != CURRENT_ARGO_HOST:
                             CURRENT_ARGO_HOST = new_host
+                            global node_name_task
+                            if node_name_task and not node_name_task.done():
+                                try:
+                                    await asyncio.wait_for(asyncio.shield(node_name_task), timeout=5.0)
+                                except Exception:
+                                    pass
                             display_node_info(CURRENT_ARGO_HOST)
                             await notify_telegram(CURRENT_ARGO_HOST)
-                    elif re.search(r'(ERR|error|fail|refused|unable|panic|fatal)', line_str, re.I):
+                    elif not re.search(r'(\bINF\b|hard_fail=false)', line_str, re.I) and re.search(r'(ERR|error|\bfail(ed|ure)?\b|refused|unable|panic|fatal)', line_str, re.I):
                         print(f"[Argo临时隧道异常] {line_str}", file=sys.stderr)
 
             asyncio.create_task(monitor_stderr())
@@ -719,7 +756,7 @@ async def handle_sub(request):
     )
 
 # ── 出站安全阻断名单 (基于 DNS 解析与网段判定，防 SSRF、回环及云厂商元数据劫持) ─
-ALLOW_LAN = os.environ.get('ALLOW_LAN', '').lower() in ('true', '1')
+ALLOW_LAN = os.environ.get('ALLOW_LAN', '').strip().lower() in ('true', '1', 'yes')
 
 BLOCKED_NETWORKS = [
     ipaddress.ip_network('0.0.0.0/8'),
@@ -1309,12 +1346,14 @@ async def on_startup(app):
     loop = asyncio.get_running_loop()
     loop.set_exception_handler(handle_global_exception)
 
-    await resolve_node_name()
+    global node_name_task
+    node_name_task = asyncio.create_task(resolve_node_name())
     listen_addr = '0.0.0.0 / [::]' if is_dual_stack else HOST
     print("====================================================")
     print("🚀 Argo (Zero-Binary 纯原生穿透引擎 - Python版) 已启动")
     print(f"📡 内部监听: {listen_addr}:{PORT} (双栈兼容 localhost/127.0.0.1)")
-    print(f"🏷️  节点标识: {NODE_NAME}")
+    if NODE_NAME:
+        print(f"🏷️  节点标识: {NODE_NAME}")
     print(f"🔑 核心 UUID: {UUID}")
     print(f"🔒 独立密码: {PASSWORD}")
     print("====================================================")

@@ -410,23 +410,23 @@ ensure_nodejs() {
                 apk add --no-cache nodejs npm
             elif command -v apt-get >/dev/null 2>&1; then
                 if command -v curl >/dev/null 2>&1; then
-                    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+                    curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
                 else
-                    wget -qO- https://deb.nodesource.com/setup_20.x | bash -
+                    wget -qO- https://deb.nodesource.com/setup_22.x | bash -
                 fi
                 apt-get install -y nodejs
             elif command -v dnf >/dev/null 2>&1; then
                 if command -v curl >/dev/null 2>&1; then
-                    curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+                    curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -
                 else
-                    wget -qO- https://rpm.nodesource.com/setup_20.x | bash -
+                    wget -qO- https://rpm.nodesource.com/setup_22.x | bash -
                 fi
                 dnf install -y nodejs
             elif command -v yum >/dev/null 2>&1; then
                 if command -v curl >/dev/null 2>&1; then
-                    curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+                    curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -
                 else
-                    wget -qO- https://rpm.nodesource.com/setup_20.x | bash -
+                    wget -qO- https://rpm.nodesource.com/setup_22.x | bash -
                 fi
                 yum install -y nodejs
             fi
@@ -438,7 +438,7 @@ ensure_nodejs() {
             if [[ "$uarch" == "aarch64" || "$uarch" == "arm64" ]]; then
                 arch="arm64"
             fi
-            local node_ver="v20.18.0"
+            local node_ver="v22.14.0"
             local node_tar="node-${node_ver}-linux-${arch}.tar.xz"
             local node_url="https://nodejs.org/dist/${node_ver}/${node_tar}"
             mkdir -p "$APP_DIR/node"
