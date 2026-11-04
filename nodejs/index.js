@@ -37,7 +37,13 @@ const PRESET_TG_CHAT_ID        = ''; // Telegram Chat ID
 
 // ── 变量解析（优先读取 PRESET，其次读取环境变量，最后自动生成随机 UUID）──────────
 const UUID            = (PRESET_UUID           || process.env.UUID            || crypto.randomUUID()).trim().toLowerCase();
+const UUID_REGEX      = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+if (!UUID_REGEX.test(UUID)) {
+  console.error(`[FATAL] 核心 UUID 格式无效: "${UUID}"！必须为标准的 32 位十六进制 UUID（例如: 8fce614c-83b5-442b-928d-c78278f2e2cb）`);
+  process.exit(1);
+}
 const PASSWORD        = (PRESET_PASSWORD       || process.env.PASSWORD        || process.env.TROJAN_PASSWORD || UUID).trim();
+const HOST            = (process.env.HOST      || '127.0.0.1').trim();
 const PORT            = parseInt(process.env.PORT || '3000', 10);
 const SUB_PATH        = (PRESET_SUB            || process.env.SUB             || 'sub').replace(/^\/+/, '');
 let   NODE_NAME       = (PRESET_NAME           || process.env.NAME            || '').trim();
@@ -358,6 +364,8 @@ function getOrCreateXhttpSession(sessionId, protocol = 'vless') {
       downlinkRes: null,
       uplinkQueue: [],
       downlinkQueue: [],
+      nextUplinkSeq: 0,
+      pendingUplinkMap: new Map(),
       isParsed: false,
       isConnected: false,
       handshakeSent: false,
@@ -371,8 +379,7 @@ function getOrCreateXhttpSession(sessionId, protocol = 'vless') {
   return session;
 }
 
-function processXhttpUplinkData(session, data) {
-  refreshSessionTimer(session);
+function dispatchUplinkData(session, data) {
   if (!session.isParsed) {
     session.headerBuf = Buffer.concat([session.headerBuf, data]);
     if (session.headerBuf.length > 2048) {
@@ -436,8 +443,36 @@ function processXhttpUplinkData(session, data) {
   }
 }
 
+function processXhttpUplinkData(session, data, seq = null) {
+  refreshSessionTimer(session);
+  if (seq === null) {
+    dispatchUplinkData(session, data);
+    return;
+  }
+
+  // 严格按 seq 序号保序消费，防止 CDN/HTTP2 并发乱序损坏数据流
+  if (seq === session.nextUplinkSeq) {
+    dispatchUplinkData(session, data);
+    session.nextUplinkSeq++;
+
+    while (session.pendingUplinkMap.has(session.nextUplinkSeq)) {
+      const nextData = session.pendingUplinkMap.get(session.nextUplinkSeq);
+      session.pendingUplinkMap.delete(session.nextUplinkSeq);
+      dispatchUplinkData(session, nextData);
+      session.nextUplinkSeq++;
+    }
+  } else if (seq > session.nextUplinkSeq) {
+    // 提前到达的后序包，放入乱序缓冲区暂存（最多容纳 200 包防止恶意内存膨胀）
+    if (session.pendingUplinkMap.size < 200) {
+      session.pendingUplinkMap.set(seq, data);
+    }
+  }
+}
+
 function handleXhttpSession(req, res, pathParts, protocol) {
   const sessionId = pathParts[1];
+  const seqStr = pathParts[2];
+  const seq = seqStr !== undefined && /^\d+$/.test(seqStr) ? parseInt(seqStr, 10) : null;
   const session = getOrCreateXhttpSession(sessionId, protocol);
   if (!session) {
     res.writeHead(400, { 'Content-Type': 'text/plain' });
@@ -500,7 +535,7 @@ function handleXhttpSession(req, res, pathParts, protocol) {
       res.end('OK');
 
       if (data.length > 0) {
-        processXhttpUplinkData(session, data);
+        processXhttpUplinkData(session, data, seq);
       }
     });
     req.on('error', () => cleanupXhttpSession(sessionId));
@@ -709,19 +744,33 @@ if (WebSocket) {
 
   // VLESS WS 处理
   wssVless.on('connection', (ws) => {
-    let remoteSocket = null, isHeaderParsed = false;
+    let remoteSocket = null, isHeaderParsed = false, isWsClosed = false;
+
+    const onEarlyDisconnect = () => {
+      isWsClosed = true;
+      if (remoteSocket && !remoteSocket.destroyed) remoteSocket.destroy();
+    };
+    ws.on('close', onEarlyDisconnect);
+    ws.on('error', onEarlyDisconnect);
+
     ws.on('message', (chunk) => {
+      if (isWsClosed) return;
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       if (!isHeaderParsed) {
         const parsed = parseVlessHeader(buffer);
         if (!parsed || isBlockedTarget(parsed.targetHost)) { ws.close(); return; }
         isHeaderParsed = true;
         remoteSocket = net.connect({ host: parsed.targetHost, port: parsed.targetPort }, () => {
-          if (ws.readyState === WebSocket.OPEN) ws.send(Buffer.from([0, 0]));
+          if (isWsClosed || ws.readyState !== WebSocket.OPEN) {
+            remoteSocket.destroy();
+            return;
+          }
+          ws.send(Buffer.from([0, 0]));
           if (parsed.payload.length > 0) remoteSocket.write(parsed.payload);
           setupDuplexPipe(ws, remoteSocket);
         });
-        remoteSocket.on('error', () => ws.close());
+        remoteSocket.on('error', () => { if (ws.readyState === WebSocket.OPEN) ws.close(); });
+        remoteSocket.on('close', () => { if (ws.readyState === WebSocket.OPEN) ws.close(); });
       } else {
         if (remoteSocket && !remoteSocket.destroyed) remoteSocket.write(buffer);
       }
@@ -730,18 +779,32 @@ if (WebSocket) {
 
   // Trojan WS 处理
   wssTrojan.on('connection', (ws) => {
-    let remoteSocket = null, isHeaderParsed = false;
+    let remoteSocket = null, isHeaderParsed = false, isWsClosed = false;
+
+    const onEarlyDisconnect = () => {
+      isWsClosed = true;
+      if (remoteSocket && !remoteSocket.destroyed) remoteSocket.destroy();
+    };
+    ws.on('close', onEarlyDisconnect);
+    ws.on('error', onEarlyDisconnect);
+
     ws.on('message', (chunk) => {
+      if (isWsClosed) return;
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       if (!isHeaderParsed) {
         const parsed = parseTrojanHeader(buffer);
         if (!parsed || isBlockedTarget(parsed.targetHost)) { ws.close(); return; }
         isHeaderParsed = true;
         remoteSocket = net.connect({ host: parsed.targetHost, port: parsed.targetPort }, () => {
+          if (isWsClosed || ws.readyState !== WebSocket.OPEN) {
+            remoteSocket.destroy();
+            return;
+          }
           if (parsed.payload.length > 0) remoteSocket.write(parsed.payload);
           setupDuplexPipe(ws, remoteSocket);
         });
-        remoteSocket.on('error', () => ws.close());
+        remoteSocket.on('error', () => { if (ws.readyState === WebSocket.OPEN) ws.close(); });
+        remoteSocket.on('close', () => { if (ws.readyState === WebSocket.OPEN) ws.close(); });
       } else {
         if (remoteSocket && !remoteSocket.destroyed) remoteSocket.write(buffer);
       }
@@ -750,25 +813,27 @@ if (WebSocket) {
 }
 
 function setupDuplexPipe(ws, remoteSocket) {
-  // 背压机制：当 ws 缓冲区积压超过 1MB 时暂停远端读取，待排出后恢复
+  // 事件驱动背压：利用 ws.send 完成回调驱动恢复，彻底移除 50ms 轮询定时器
   remoteSocket.on('data', (d) => {
     if (ws.readyState === WebSocket.OPEN) {
-      ws.send(d);
+      ws.send(d, (err) => {
+        if (err) {
+          remoteSocket.destroy();
+          return;
+        }
+        if (remoteSocket && !remoteSocket.destroyed && remoteSocket.isPaused()) {
+          if (ws.bufferedAmount < 256 * 1024) {
+            remoteSocket.resume();
+          }
+        }
+      });
       if (ws.bufferedAmount > 1024 * 1024) {
         remoteSocket.pause();
       }
     }
   });
 
-  const drainTimer = setInterval(() => {
-    if (ws.bufferedAmount < 256 * 1024 && remoteSocket.isPaused()) {
-      remoteSocket.resume();
-    }
-  }, 50);
-  drainTimer.unref();
-
   const cleanup = () => {
-    clearInterval(drainTimer);
     if (remoteSocket && !remoteSocket.destroyed) remoteSocket.destroy();
     if (ws.readyState === WebSocket.OPEN) ws.close();
   };
@@ -1128,12 +1193,12 @@ async function startKomari() {
 // ── 9. 服务启动入口 ─────────────────────────────────────────────────────────
 killStaleByTag();
 
-server.listen(PORT, '0.0.0.0', async () => {
+server.listen(PORT, HOST, async () => {
   await resolveNodeName();
 
   console.log(`====================================================`);
   console.log(`🚀 Argo (Zero-Binary 纯原生穿透引擎) 已启动`);
-  console.log(`📡 内部监听: 127.0.0.1:${PORT} (无需公网入站端口)`);
+  console.log(`📡 内部监听: ${HOST}:${PORT} (无需公网入站端口)`);
   console.log(`🏷️  节点标识: ${NODE_NAME}`);
   console.log(`🔑 核心 UUID: ${UUID}`);
   console.log(`🔒 独立密码: ${PASSWORD}`);

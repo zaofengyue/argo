@@ -472,7 +472,7 @@ set_env() {
     if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
         sed -i "/^${key}=/d" "$ENV_FILE"
     fi
-    echo "${key}=\"${val}\"" >> "$ENV_FILE"
+    printf '%s=%q\n' "$key" "$val" >> "$ENV_FILE"
 }
 
 # ── 极速安装向导 (支持交互式与环境变量无人值守两种模式) ───────────────────────
@@ -550,6 +550,7 @@ quick_install_wizard() {
         fi
     fi
     set_env "PORT" "$final_port"
+    set_env "HOST" "127.0.0.1"
 
     # 4. 节点名称
     local def_name="${NAME:-$(get_env "NAME")}"

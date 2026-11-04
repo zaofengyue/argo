@@ -41,7 +41,12 @@ PRESET_TG_CHAT_ID        = '' # Telegram Chat ID
 
 # ── 变量解析（优先读取 PRESET，其次读取环境变量，最后自动生成随机 UUID）──────────
 UUID            = (PRESET_UUID           or os.environ.get('UUID')            or str(uuid.uuid4())).strip().lower()
+UUID_REGEX      = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+if not UUID_REGEX.match(UUID):
+    print(f"[FATAL] 核心 UUID 格式无效: \"{UUID}\"！必须为标准的 32 位十六进制 UUID（例如: 8fce614c-83b5-442b-928d-c78278f2e2cb）")
+    exit(1)
 PASSWORD        = (PRESET_PASSWORD       or os.environ.get('PASSWORD')        or os.environ.get('TROJAN_PASSWORD') or UUID).strip()
+HOST            = os.environ.get('HOST', '127.0.0.1').strip()
 PORT            = int(os.environ.get('PORT') or 3000)
 SUB_PATH        = (PRESET_SUB            or os.environ.get('SUB')             or 'sub').lstrip('/')
 NODE_NAME       = (PRESET_NAME           or os.environ.get('NAME')            or '').strip()
@@ -709,6 +714,8 @@ def get_or_create_xhttp_session(session_id: str, protocol: str = 'vless'):
             'r_writer': None,
             'downlink_queue': asyncio.Queue(),
             'uplink_queue': asyncio.Queue(),
+            'next_uplink_seq': 0,
+            'pending_uplink_map': {},
             'is_parsed': False,
             'is_connected': False,
             'handshake_sent': False,
@@ -754,10 +761,9 @@ async def cleanup_xhttp_session(session_id: str):
         if not t.done():
             t.cancel()
 
-async def process_xhttp_uplink(sess: dict, data: bytes):
+async def dispatch_xhttp_uplink(sess: dict, data: bytes):
     if sess['closed']:
         return
-    sess['last_active'] = time.time()
     if not sess['is_parsed']:
         sess['header_buf'].extend(data)
         if len(sess['header_buf']) > 2048:
@@ -815,6 +821,27 @@ async def process_xhttp_uplink(sess: dict, data: bytes):
         else:
             await sess['uplink_queue'].put(data)
 
+async def process_xhttp_uplink(sess: dict, data: bytes, seq: int = None):
+    if sess['closed']:
+        return
+    sess['last_active'] = time.time()
+    if seq is None:
+        await dispatch_xhttp_uplink(sess, data)
+        return
+
+    # 严格按 seq 序号保序消费，防止 CDN/HTTP2 并发乱序损坏数据流
+    if seq == sess['next_uplink_seq']:
+        await dispatch_xhttp_uplink(sess, data)
+        sess['next_uplink_seq'] += 1
+
+        while sess['next_uplink_seq'] in sess['pending_uplink_map']:
+            next_data = sess['pending_uplink_map'].pop(sess['next_uplink_seq'])
+            await dispatch_xhttp_uplink(sess, next_data)
+            sess['next_uplink_seq'] += 1
+    elif seq > sess['next_uplink_seq']:
+        if len(sess['pending_uplink_map']) < 200:
+            sess['pending_uplink_map'][seq] = data
+
 @routes.get(f"{PATH_XHTTP}/{{session_id}}")
 async def handle_vless_xhttp_get(request):
     if not ARGO_DOMAIN:
@@ -849,12 +876,14 @@ async def handle_vless_xhttp_post(request):
     if not ARGO_DOMAIN:
         return web.Response(status=404, text="Not Found")
     session_id = request.match_info['session_id']
+    seq_str = request.match_info.get('seq')
+    seq = int(seq_str) if seq_str and seq_str.isdigit() else None
     sess = get_or_create_xhttp_session(session_id, 'vless')
     if not sess:
         return web.Response(status=400, text="Bad Request")
     data = await request.read()
     if data:
-        await process_xhttp_uplink(sess, data)
+        await process_xhttp_uplink(sess, data, seq)
     return web.Response(status=200, text="OK")
 
 @routes.get(f"{PATH_TROJAN_XHTTP}/{{session_id}}")
@@ -891,12 +920,14 @@ async def handle_trojan_xhttp_post(request):
     if not ARGO_DOMAIN:
         return web.Response(status=404, text="Not Found")
     session_id = request.match_info['session_id']
+    seq_str = request.match_info.get('seq')
+    seq = int(seq_str) if seq_str and seq_str.isdigit() else None
     sess = get_or_create_xhttp_session(session_id, 'trojan')
     if not sess:
         return web.Response(status=400, text="Bad Request")
     data = await request.read()
     if data:
-        await process_xhttp_uplink(sess, data)
+        await process_xhttp_uplink(sess, data, seq)
     return web.Response(status=200, text="OK")
 
 @routes.post(PATH_XHTTP)
@@ -1119,7 +1150,7 @@ async def on_startup(app):
     await resolve_node_name()
     print("====================================================")
     print("🚀 Argo (Zero-Binary 纯原生穿透引擎 - Python版) 已启动")
-    print(f"📡 内部监听: 127.0.0.1:{PORT} (无需公网入站端口)")
+    print(f"📡 内部监听: {HOST}:{PORT} (无需公网入站端口)")
     print(f"🏷️  节点标识: {NODE_NAME}")
     print(f"🔑 核心 UUID: {UUID}")
     print(f"🔒 独立密码: {PASSWORD}")
@@ -1161,7 +1192,7 @@ def main():
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
 
-    web.run_app(app, host='0.0.0.0', port=PORT)
+    web.run_app(app, host=HOST, port=PORT)
 
 if __name__ == '__main__':
     main()
