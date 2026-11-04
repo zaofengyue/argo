@@ -664,6 +664,7 @@ manage_bbr() {
             sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf 2>/dev/null || true
             sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf 2>/dev/null || true
             echo "net.ipv4.tcp_congestion_control=cubic" >> /etc/sysctl.conf
+            sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
             sysctl -p >/dev/null 2>&1 || true
             log_info "已关闭 BBR 加速！"
         else
@@ -674,6 +675,7 @@ manage_bbr() {
         read -rp "是否立即开启 Linux 原生 TCP BBR 加速? [y/N]: " choice_bbr
         if [[ "$choice_bbr" == "y" || "$choice_bbr" == "Y" ]]; then
             modprobe tcp_bbr 2>/dev/null || true
+            modprobe sch_fq 2>/dev/null || true
             if ! grep -qw "bbr" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
                 log_error "当前系统内核不支持 BBR（常见于 OpenVZ / LXC 架构容器或老旧内核版本）！"
                 sleep 2
@@ -683,6 +685,8 @@ manage_bbr() {
             sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf 2>/dev/null || true
             echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
             echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+            sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
+            sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
             sysctl -p >/dev/null 2>&1 || true
             local new_cc
             new_cc=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)
