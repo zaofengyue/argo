@@ -988,6 +988,13 @@ async def dispatch_xhttp_uplink(sess: dict, data: bytes):
             if not r_reader:
                 await cleanup_xhttp_session(sess['id'])
                 return
+            if sess['closed'] or sess['id'] not in xhttp_sessions:
+                try:
+                    r_writer.close()
+                    await r_writer.wait_closed()
+                except Exception:
+                    pass
+                return
             sess['r_reader'] = r_reader
             sess['r_writer'] = r_writer
             sess['is_connected'] = True
@@ -1197,6 +1204,11 @@ async def handle_xhttp(request):
                     break
                 r_writer.write(chunk)
                 await r_writer.drain()
+            if hasattr(r_writer, 'can_write_eof') and r_writer.can_write_eof():
+                try:
+                    r_writer.write_eof()
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -1213,10 +1225,20 @@ async def handle_xhttp(request):
     t1 = asyncio.create_task(pipe_req_to_remote())
     t2 = asyncio.create_task(pipe_remote_to_resp())
     try:
-        done, pending = await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
-        for p in pending:
-            p.cancel()
+        while not t2.done():
+            if t1.done() and t1.exception():
+                break
+            done, _ = await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
+            if t2 in done:
+                break
+            if t1 in done:
+                if t1.exception():
+                    break
+                await t2
+                break
     finally:
+        t1.cancel()
+        t2.cancel()
         try:
             r_writer.close()
             await r_writer.wait_closed()
@@ -1259,6 +1281,11 @@ async def handle_trojan_xhttp(request):
                     break
                 r_writer.write(chunk)
                 await r_writer.drain()
+            if hasattr(r_writer, 'can_write_eof') and r_writer.can_write_eof():
+                try:
+                    r_writer.write_eof()
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -1275,10 +1302,20 @@ async def handle_trojan_xhttp(request):
     t1 = asyncio.create_task(pipe_req_to_remote())
     t2 = asyncio.create_task(pipe_remote_to_resp())
     try:
-        done, pending = await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
-        for p in pending:
-            p.cancel()
+        while not t2.done():
+            if t1.done() and t1.exception():
+                break
+            done, _ = await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
+            if t2 in done:
+                break
+            if t1 in done:
+                if t1.exception():
+                    break
+                await t2
+                break
     finally:
+        t1.cancel()
+        t2.cancel()
         try:
             r_writer.close()
             await r_writer.wait_closed()
