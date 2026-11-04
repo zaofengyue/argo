@@ -722,19 +722,19 @@ config_menu() {
         [[ -z "$cur_name" ]] && cur_name="自动探测"
         cur_domain=$(get_env "ARGO_DOMAIN")
         cur_auth=$(get_env "ARGO_AUTH")
-        cur_argo="未配置 (使用临时隧道)"
-        [[ -n "$cur_domain" && -n "$cur_auth" ]] && cur_argo="已配置 (${cur_domain})"
+        cur_argo="未配置"
+        [[ -n "$cur_domain" && -n "$cur_auth" ]] && cur_argo="已配置"
 
         cur_cf=$(get_env "CF_PREFER_HOST")
         [[ -z "$cur_cf" ]] && cur_cf="www.visa.com.tw"
 
         cur_proto=$(get_env "ARGO_PROTOCOL")
-        [[ -z "$cur_proto" ]] && cur_proto="auto (自动协商)"
+        [[ -z "$cur_proto" ]] && cur_proto="auto"
 
         cur_km_domain=$(get_env "KOMARI_DOMAIN")
         cur_km_token=$(get_env "KOMARI_TOKEN")
         cur_km="未配置"
-        [[ -n "$cur_km_domain" && -n "$cur_km_token" ]] && cur_km="已配置 (${cur_km_domain})"
+        [[ -n "$cur_km_domain" && -n "$cur_km_token" ]] && cur_km="已配置"
 
         cur_bbr=$(get_bbr_status)
 
@@ -839,7 +839,7 @@ config_menu() {
                 ;;
             7)
                 echo -e "\n当前 Argo 隧道协议: ${GREEN}${cur_proto}${NC}"
-                echo -e "可选值: ${CYAN}quic${NC} (基于 UDP，抗丢包高并发) / ${CYAN}http2${NC} (基于 TCP) / ${CYAN}auto${NC} (由 cloudflared 自动协商)"
+                echo -e "可选值: ${CYAN}quic${NC} / ${CYAN}http2${NC} / ${CYAN}auto${NC}"
                 read -rp "请输入新的协议 (输入 'quic' / 'http2' / 'auto'，留空保持原值): " new_val
                 if [[ "$new_val" == "auto" || "$new_val" == "none" ]]; then
                     set_env "ARGO_PROTOCOL" ""
