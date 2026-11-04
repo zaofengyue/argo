@@ -5,6 +5,7 @@
 const http = require('http');
 const https = require('https');
 const net = require('net');
+const dns = require('dns');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -317,17 +318,81 @@ function generateNodeLinks(host, preferHost) {
   return [vlessXhttp, vlessWs, trojanXhttp, trojanWs];
 }
 
-// ── XHTTP (SplitHTTP) 会话多路复用连接池 (packet-up / packet-down 架构) ─────
+// ── 出站安全阻断名单 (基于 DNS 解析与网段判定，防 SSRF、回环及云厂商元数据劫持) ─
+const ALLOW_LAN = process.env.ALLOW_LAN === 'true';
+const blockList = new net.BlockList();
+
+// 1. 本机回环与未指定
+blockList.addSubnet('127.0.0.0', 8);
+blockList.addSubnet('0.0.0.0', 8);
+blockList.addAddress('::1', 'ipv6');
+blockList.addSubnet('::ffff:127.0.0.0', 104, 'ipv6');
+
+// 2. 链路本地 & 云厂商元数据 (AWS / Azure / GCP)
+blockList.addSubnet('169.254.0.0', 16);
+blockList.addSubnet('fe80::', 10, 'ipv6');
+
+// 3. 运营商级 NAT (CGNAT) & 阿里云专用元数据 (100.100.100.200)
+blockList.addSubnet('100.64.0.0', 10);
+
+// 4. 私有局域网网段（默认阻断保护，设置 ALLOW_LAN=true 可按需放行家庭内网）
+if (!ALLOW_LAN) {
+  blockList.addSubnet('10.0.0.0', 8);
+  blockList.addSubnet('172.16.0.0', 12);
+  blockList.addSubnet('192.168.0.0', 16);
+  blockList.addSubnet('fc00::', 7, 'ipv6');
+}
+
+function checkIpBlocked(ipStr, family = 'ipv4') {
+  try {
+    return blockList.check(ipStr, family);
+  } catch {
+    return true;
+  }
+}
+
+function resolveAndConnect(targetHost, targetPort, onConnected, onError) {
+  if (!targetHost) {
+    if (onError) onError(new Error('Empty targetHost'));
+    return;
+  }
+  const h = targetHost.toLowerCase().trim().replace(/\.$/, '');
+  if (h === 'localhost' || h.endsWith('.internal') || h.endsWith('.local')) {
+    if (onError) onError(new Error(`Blocked host: ${targetHost}`));
+    return;
+  }
+
+  const isIp = net.isIP(h);
+  if (isIp) {
+    const family = isIp === 6 ? 'ipv6' : 'ipv4';
+    if (checkIpBlocked(h, family)) {
+      if (onError) onError(new Error(`Blocked IP: ${targetHost}`));
+      return;
+    }
+    const socket = net.connect({ host: h, port: targetPort }, () => onConnected(socket));
+    if (onError) socket.on('error', onError);
+    return socket;
+  }
+
+  // 域名：先经 DNS 解析，校验真实 IP，防 DNS 重绑定打穿内网
+  dns.lookup(h, { all: false }, (err, address, family) => {
+    if (err || !address) {
+      if (onError) onError(err || new Error(`DNS lookup failed for ${h}`));
+      return;
+    }
+    const famStr = family === 6 ? 'ipv6' : 'ipv4';
+    if (checkIpBlocked(address, famStr)) {
+      if (onError) onError(new Error(`Resolved to blocked IP: ${address} (${h})`));
+      return;
+    }
+    const socket = net.connect({ host: address, port: targetPort }, () => onConnected(socket));
+    if (onError) socket.on('error', onError);
+  });
+}
+
+// ── XHTTP (SplitHTTP) 会话多路复用连接池 (双层缓冲保护) ─────────────────────
 const MAX_XHTTP_SESSIONS = 5000;
 const xhttpSessions = new Map();
-
-function isBlockedTarget(host) {
-  if (!host) return true;
-  const h = host.toLowerCase().trim();
-  if (h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '0.0.0.0') return true;
-  if (h.startsWith('127.') || h.startsWith('169.254.')) return true;
-  return false;
-}
 
 function cleanupXhttpSession(sessionId) {
   const session = xhttpSessions.get(sessionId);
@@ -354,8 +419,18 @@ function getOrCreateXhttpSession(sessionId, protocol = 'vless') {
   let session = xhttpSessions.get(sessionId);
   if (!session) {
     if (xhttpSessions.size >= MAX_XHTTP_SESSIONS) {
-      const oldestKey = xhttpSessions.keys().next().value;
-      if (oldestKey) cleanupXhttpSession(oldestKey);
+      // 双层保护：优先淘汰尚未完成认证（未收到有效握手）的空头/垃圾会话
+      let evictedKey = null;
+      for (const [key, s] of xhttpSessions.entries()) {
+        if (!s.isAuthenticated) {
+          evictedKey = key;
+          break;
+        }
+      }
+      if (!evictedKey) {
+        evictedKey = xhttpSessions.keys().next().value;
+      }
+      if (evictedKey) cleanupXhttpSession(evictedKey);
     }
     session = {
       id: sessionId,
@@ -368,12 +443,16 @@ function getOrCreateXhttpSession(sessionId, protocol = 'vless') {
       pendingUplinkMap: new Map(),
       isParsed: false,
       isConnected: false,
+      isAuthenticated: false, // 收到正确密码的握手后才置为 true
       handshakeSent: false,
       headerBuf: Buffer.alloc(0),
       createdAt: Date.now(),
       timer: null
     };
-    refreshSessionTimer(session);
+    // 初始由 GET 创建的未认证会话给予 15 秒等待握手，超时自动销毁
+    session.timer = setTimeout(() => {
+      if (!session.isAuthenticated) cleanupXhttpSession(session.id);
+    }, 15000);
     xhttpSessions.set(sessionId, session);
   }
   return session;
@@ -391,12 +470,11 @@ function dispatchUplinkData(session, data) {
       : parseTrojanHeader(session.headerBuf);
 
     if (parsed) {
-      if (isBlockedTarget(parsed.targetHost)) {
-        cleanupXhttpSession(session.id);
-        return;
-      }
       session.isParsed = true;
-      const remoteSocket = net.connect({ host: parsed.targetHost, port: parsed.targetPort }, () => {
+      session.isAuthenticated = true; // 认证通过！升级为正式活跃会话
+      refreshSessionTimer(session);   // 切换为正常 60s 闲置超时
+
+      resolveAndConnect(parsed.targetHost, parsed.targetPort, (remoteSocket) => {
         session.isConnected = true;
         if (session.protocol === 'vless' && session.downlinkRes && !session.handshakeSent) {
           session.downlinkRes.write(Buffer.from([0, 0]));
@@ -411,28 +489,30 @@ function dispatchUplinkData(session, data) {
           }
           session.uplinkQueue = [];
         }
-      });
 
-      remoteSocket.on('data', (chunk) => {
-        refreshSessionTimer(session);
-        if (session.downlinkRes && !session.downlinkRes.writableEnded) {
-          if (!session.downlinkRes.write(chunk)) {
-            remoteSocket.pause();
+        remoteSocket.on('data', (chunk) => {
+          refreshSessionTimer(session);
+          if (session.downlinkRes && !session.downlinkRes.writableEnded) {
+            if (!session.downlinkRes.write(chunk)) {
+              remoteSocket.pause();
+            }
+          } else {
+            session.downlinkQueue.push(chunk);
           }
-        } else {
-          session.downlinkQueue.push(chunk);
-        }
-      });
-
-      if (session.downlinkRes) {
-        session.downlinkRes.on('drain', () => {
-          if (remoteSocket && !remoteSocket.destroyed) remoteSocket.resume();
         });
-      }
 
-      remoteSocket.on('close', () => cleanupXhttpSession(session.id));
-      remoteSocket.on('error', () => cleanupXhttpSession(session.id));
-      session.remoteSocket = remoteSocket;
+        if (session.downlinkRes) {
+          session.downlinkRes.on('drain', () => {
+            if (remoteSocket && !remoteSocket.destroyed) remoteSocket.resume();
+          });
+        }
+
+        remoteSocket.on('close', () => cleanupXhttpSession(session.id));
+        remoteSocket.on('error', () => cleanupXhttpSession(session.id));
+        session.remoteSocket = remoteSocket;
+      }, () => {
+        cleanupXhttpSession(session.id);
+      });
     }
   } else {
     if (session.isConnected && session.remoteSocket && !session.remoteSocket.destroyed) {
@@ -593,14 +673,9 @@ const server = http.createServer((req, res) => {
 
             const parsed = parseVlessHeader(fullBuf);
             if (parsed) {
-              if (isBlockedTarget(parsed.targetHost)) {
-                res.writeHead(403, { 'Content-Type': 'text/plain' });
-                res.end('Forbidden');
-                req.destroy();
-                return;
-              }
               isParsed = true;
-              remoteSocket = net.connect({ host: parsed.targetHost, port: parsed.targetPort }, () => {
+              resolveAndConnect(parsed.targetHost, parsed.targetPort, (sock) => {
+                remoteSocket = sock;
                 res.writeHead(200, {
                   'Content-Type': 'application/octet-stream',
                   'Transfer-Encoding': 'chunked',
@@ -618,8 +693,11 @@ const server = http.createServer((req, res) => {
                 res.on('drain', () => remoteSocket.resume());
                 remoteSocket.on('close', () => res.end());
                 remoteSocket.on('error', () => res.end());
+              }, () => {
+                res.writeHead(403, { 'Content-Type': 'text/plain' });
+                res.end('Forbidden');
+                req.destroy();
               });
-              remoteSocket.on('error', () => res.destroy());
             }
           } else {
             if (remoteSocket && !remoteSocket.destroyed) remoteSocket.write(chunk);
@@ -663,14 +741,9 @@ const server = http.createServer((req, res) => {
 
             const parsed = parseTrojanHeader(fullBuf);
             if (parsed) {
-              if (isBlockedTarget(parsed.targetHost)) {
-                res.writeHead(403, { 'Content-Type': 'text/plain' });
-                res.end('Forbidden');
-                req.destroy();
-                return;
-              }
               isParsed = true;
-              remoteSocket = net.connect({ host: parsed.targetHost, port: parsed.targetPort }, () => {
+              resolveAndConnect(parsed.targetHost, parsed.targetPort, (sock) => {
+                remoteSocket = sock;
                 res.writeHead(200, {
                   'Content-Type': 'application/octet-stream',
                   'Transfer-Encoding': 'chunked',
@@ -687,8 +760,11 @@ const server = http.createServer((req, res) => {
                 res.on('drain', () => remoteSocket.resume());
                 remoteSocket.on('close', () => res.end());
                 remoteSocket.on('error', () => res.end());
+              }, () => {
+                res.writeHead(403, { 'Content-Type': 'text/plain' });
+                res.end('Forbidden');
+                req.destroy();
               });
-              remoteSocket.on('error', () => res.destroy());
             }
           } else {
             if (remoteSocket && !remoteSocket.destroyed) remoteSocket.write(chunk);
@@ -758,9 +834,10 @@ if (WebSocket) {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       if (!isHeaderParsed) {
         const parsed = parseVlessHeader(buffer);
-        if (!parsed || isBlockedTarget(parsed.targetHost)) { ws.close(); return; }
+        if (!parsed) { ws.close(); return; }
         isHeaderParsed = true;
-        remoteSocket = net.connect({ host: parsed.targetHost, port: parsed.targetPort }, () => {
+        resolveAndConnect(parsed.targetHost, parsed.targetPort, (sock) => {
+          remoteSocket = sock;
           if (isWsClosed || ws.readyState !== WebSocket.OPEN) {
             remoteSocket.destroy();
             return;
@@ -768,9 +845,9 @@ if (WebSocket) {
           ws.send(Buffer.from([0, 0]));
           if (parsed.payload.length > 0) remoteSocket.write(parsed.payload);
           setupDuplexPipe(ws, remoteSocket);
+        }, () => {
+          ws.close();
         });
-        remoteSocket.on('error', () => { if (ws.readyState === WebSocket.OPEN) ws.close(); });
-        remoteSocket.on('close', () => { if (ws.readyState === WebSocket.OPEN) ws.close(); });
       } else {
         if (remoteSocket && !remoteSocket.destroyed) remoteSocket.write(buffer);
       }
@@ -793,18 +870,19 @@ if (WebSocket) {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       if (!isHeaderParsed) {
         const parsed = parseTrojanHeader(buffer);
-        if (!parsed || isBlockedTarget(parsed.targetHost)) { ws.close(); return; }
+        if (!parsed) { ws.close(); return; }
         isHeaderParsed = true;
-        remoteSocket = net.connect({ host: parsed.targetHost, port: parsed.targetPort }, () => {
+        resolveAndConnect(parsed.targetHost, parsed.targetPort, (sock) => {
+          remoteSocket = sock;
           if (isWsClosed || ws.readyState !== WebSocket.OPEN) {
             remoteSocket.destroy();
             return;
           }
           if (parsed.payload.length > 0) remoteSocket.write(parsed.payload);
           setupDuplexPipe(ws, remoteSocket);
+        }, () => {
+          ws.close();
         });
-        remoteSocket.on('error', () => { if (ws.readyState === WebSocket.OPEN) ws.close(); });
-        remoteSocket.on('close', () => { if (ws.readyState === WebSocket.OPEN) ws.close(); });
       } else {
         if (remoteSocket && !remoteSocket.destroyed) remoteSocket.write(buffer);
       }
