@@ -1156,7 +1156,7 @@ uninstall_argo() {
 main_menu() {
     clear
     echo -e "${CYAN}====================================================${NC}"
-    echo -e "${WHITE}      Argo - Zero-Binary 纯原生代理服务端管理面板${NC}"
+    echo -e "${WHITE}            Argo - Zero-Binary 管理面板${NC}"
     echo -e "${CYAN}====================================================${NC}"
     check_status
     echo -e "${CYAN}----------------------------------------------------${NC}"
