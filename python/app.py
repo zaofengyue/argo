@@ -432,18 +432,6 @@ def schedule_sub_cleanup(delay_sec: int):
         return
     sub_clean_scheduled = True
 
-    if not IS_WIN:
-        try:
-            subprocess.Popen(
-                ['sh', '-c', f'sleep {delay_sec} && rm -f "{SUB_FILE}"'],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True
-            )
-            return
-        except Exception:
-            pass
-
     async def cleanup():
         await asyncio.sleep(delay_sec)
         try:
@@ -478,9 +466,11 @@ def display_node_info(host: str):
         print(f"====================================================\n")
 
         print(f"============== 已启用协议 ==============")
-        print(f"✓ VLESS  + xhttp + Argo TLS")
+        if ARGO_DOMAIN:
+            print(f"✓ VLESS  + xhttp + Argo TLS")
         print(f"✓ VLESS  + WS    + Argo TLS")
-        print(f"✓ Trojan + xhttp + Argo TLS")
+        if ARGO_DOMAIN:
+            print(f"✓ Trojan + xhttp + Argo TLS")
         print(f"✓ Trojan + WS    + Argo TLS")
         print(f"========================================\n")
 
@@ -769,12 +759,17 @@ async def handle_index(request):
 @routes.get(f'/{SUB_PATH}/')
 async def handle_sub(request):
     host = CURRENT_ARGO_HOST
+    if host == 'your-domain.com':
+        req_host = request.headers.get('Host', '').split(':')[0].strip()
+        if req_host:
+            host = req_host
     prefer = CF_PREFER_HOST or host
     links = generate_node_links(host, prefer)
     content = base64.b64encode(('\n'.join(links) + '\n').encode('utf-8')).decode('utf-8')
     return web.Response(
         text=content,
-        content_type='text/plain; charset=utf-8',
+        content_type='text/plain',
+        charset='utf-8',
         headers={'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0'}
     )
 
@@ -1474,7 +1469,7 @@ async def on_cleanup(app):
 
 def main():
     kill_stale_by_tag()
-    app = web.Application()
+    app = web.Application(client_max_size=2 * 1024 * 1024)
     app.add_routes(routes)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)

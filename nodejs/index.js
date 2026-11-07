@@ -518,7 +518,9 @@ function getOrCreateXhttpSession(sessionId, protocol = 'vless') {
       remoteSocket: null,
       downlinkRes: null,
       uplinkQueue: [],
+      uplinkQueueBytes: 0,
       downlinkQueue: [],
+      downlinkQueueBytes: 0,
       nextUplinkSeq: 0,
       pendingUplinkMap: new Map(),
       pendingUplinkBytes: 0,
@@ -581,6 +583,7 @@ function dispatchUplinkData(session, data) {
             remoteSocket.write(q);
           }
           session.uplinkQueue = [];
+          session.uplinkQueueBytes = 0;
         }
 
         remoteSocket.on('data', (chunk) => {
@@ -590,15 +593,13 @@ function dispatchUplinkData(session, data) {
               remoteSocket.pause();
             }
           } else {
+            session.downlinkQueueBytes += chunk.length;
+            if (session.downlinkQueueBytes > 4 * 1024 * 1024) {
+              return cleanupXhttpSession(session.id);
+            }
             session.downlinkQueue.push(chunk);
           }
         });
-
-        if (session.downlinkRes) {
-          session.downlinkRes.on('drain', () => {
-            if (remoteSocket && !remoteSocket.destroyed) remoteSocket.resume();
-          });
-        }
 
         remoteSocket.on('close', () => cleanupXhttpSession(session.id));
         remoteSocket.on('error', () => cleanupXhttpSession(session.id));
@@ -611,6 +612,10 @@ function dispatchUplinkData(session, data) {
     if (session.isConnected && session.remoteSocket && !session.remoteSocket.destroyed) {
       session.remoteSocket.write(data);
     } else {
+      session.uplinkQueueBytes += data.length;
+      if (session.uplinkQueueBytes > 4 * 1024 * 1024) {
+        return cleanupXhttpSession(session.id);
+      }
       session.uplinkQueue.push(data);
     }
   }
@@ -674,6 +679,9 @@ function handleXhttpSession(req, res, pathParts, protocol) {
   if (session.isAuthenticated) refreshSessionTimer(session);
 
   if (req.method === 'GET') {
+    if (session.downlinkRes && session.downlinkRes !== res && !session.downlinkRes.writableEnded) {
+      try { session.downlinkRes.end(); } catch {}
+    }
     session.downlinkRes = res;
     res.writeHead(200, {
       'Content-Type': 'application/octet-stream',
@@ -693,6 +701,7 @@ function handleXhttpSession(req, res, pathParts, protocol) {
         res.write(d);
       }
       session.downlinkQueue = [];
+      session.downlinkQueueBytes = 0;
     }
 
     res.on('drain', () => {
@@ -744,7 +753,11 @@ const server = http.createServer((req, res) => {
 
   // ① 聚合节点订阅 (/sub)
   if (reqUrl === `/${SUB_PATH}` || reqUrl === `/${SUB_PATH}/`) {
-    const host = CURRENT_ARGO_HOST;
+    let host = CURRENT_ARGO_HOST;
+    if (host === 'your-domain.com') {
+      const reqHost = (req.headers.host || '').split(':')[0].trim();
+      if (reqHost) host = reqHost;
+    }
     const prefer = CF_PREFER_HOST || host;
     const links = generateNodeLinks(host, prefer);
     const base64Content = Buffer.from(links.join('\n') + '\n').toString('base64');
@@ -1305,9 +1318,13 @@ function displayNodeInfo(host) {
     console.log(`====================================================\n`);
 
     console.log(`============== 已启用协议 ==============`);
-    console.log(`✓ VLESS  + xhttp + Argo TLS`);
+    if (ARGO_DOMAIN) {
+      console.log(`✓ VLESS  + xhttp + Argo TLS`);
+    }
     console.log(`✓ VLESS  + WS    + Argo TLS`);
-    console.log(`✓ Trojan + xhttp + Argo TLS`);
+    if (ARGO_DOMAIN) {
+      console.log(`✓ Trojan + xhttp + Argo TLS`);
+    }
     console.log(`✓ Trojan + WS    + Argo TLS`);
     console.log(`========================================\n`);
 
@@ -1577,7 +1594,7 @@ async function startArgoTunnel(localPort) {
               console.log('[Argo固定隧道] 云端连接已就绪并注册成功');
               triggerSuccess();
             }
-          } else if (!/(\bINF\b|hard_fail=false)/i && /(ERR|error|\bfail(ed|ure)?\b|refused|unable|panic|fatal)/i.test(line)) {
+          } else if (!/(\bINF\b|hard_fail=false)/i.test(line) && /(ERR|error|\bfail(ed|ure)?\b|refused|unable|panic|fatal)/i.test(line)) {
             console.error(`[Argo固定隧道异常] ${line}`);
           }
         }
@@ -1607,7 +1624,7 @@ async function startArgoTunnel(localPort) {
         for (const rawLine of lines) {
           const line = rawLine.trim();
           if (!line) continue;
-          if (!/(\bINF\b|hard_fail=false)/i && /(ERR|error|\bfail(ed|ure)?\b|refused|unable|panic|fatal)/i.test(line)) {
+          if (!/(\bINF\b|hard_fail=false)/i.test(line) && /(ERR|error|\bfail(ed|ure)?\b|refused|unable|panic|fatal)/i.test(line)) {
             console.error(`[Argo临时隧道异常] ${line}`);
           }
         }
