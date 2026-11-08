@@ -521,10 +521,11 @@ def verify_binary(bin_path: Path, flag: str) -> bool:
             # 头部魔数校验 (Linux ELF 或 Windows MZ，杜绝执行非二进制脚本/HTML)
             with open(p, 'rb') as f:
                 magic = f.read(4)
-            if platform.system().lower() == 'windows':
+            sys_name = platform.system().lower()
+            if sys_name == 'windows':
                 if not magic.startswith(b'MZ'):
                     return False
-            else:
+            elif sys_name == 'linux':
                 if magic != b'\x7fELF':
                     return False
         res = subprocess.run([str(bin_path), flag], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
@@ -1136,17 +1137,19 @@ async def handle_xhttp_get_common(request, protocol: str):
     })
     await resp.prepare(request)
 
-    # 若已有旧 GET 下行响应，通知其退出，由当前最新 GET 无缝平替
-    old_stop = sess.get('active_downlink_stop')
-    if old_stop and not old_stop.is_set():
-        old_stop.set()
+    # 若已有旧 GET 下行协程在排队，立即取消旧任务以防抢数据包并实现无缝平替
+    old_task = sess.get('active_downlink_task')
+    if old_task and not old_task.done():
+        old_task.cancel()
 
-    stop_event = asyncio.Event()
-    sess['active_downlink_stop'] = stop_event
+    curr_task = asyncio.current_task()
+    sess['active_downlink_task'] = curr_task
     sess['active_downlink_resp'] = resp
 
     try:
-        while not sess['closed'] and not stop_event.is_set():
+        while not sess['closed']:
+            if request.transport and request.transport.is_closing():
+                break
             try:
                 data = await asyncio.wait_for(sess['downlink_queue'].get(), timeout=1.0)
             except asyncio.TimeoutError:
@@ -1154,14 +1157,14 @@ async def handle_xhttp_get_common(request, protocol: str):
             if data is None:
                 break
             await resp.write(data)
-    except Exception:
+    except (Exception, asyncio.CancelledError):
         pass
     finally:
-        # 仅当整条会话已关闭，或当前响应仍是活跃下行且已作废时才清理会话，严禁旧 GET 断连误杀新会话
+        # 仅当前退出的响应仍是最新活跃下行时才回收整条会话
         if sess.get('active_downlink_resp') is resp:
             sess['active_downlink_resp'] = None
-            if sess.get('closed'):
-                await cleanup_xhttp_session(session_id)
+            sess['active_downlink_task'] = None
+            await cleanup_xhttp_session(session_id)
     return resp
 
 @routes.get(f"{PATH_XHTTP}/{{session_id}}")
@@ -1486,6 +1489,17 @@ async def handle_trojan_ws(request):
 is_dual_stack = not LISTEN_HOST or LISTEN_HOST in ('0.0.0.0', '::')
 is_loopback = LISTEN_HOST in ('127.0.0.1', 'localhost')
 
+def check_ipv6_loopback() -> bool:
+    if not socket.has_ipv6:
+        return False
+    try:
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        sock.bind(('::1', 0))
+        sock.close()
+        return True
+    except Exception:
+        return False
+
 async def on_startup(app):
     loop = asyncio.get_running_loop()
     loop.set_exception_handler(handle_global_exception)
@@ -1495,7 +1509,8 @@ async def on_startup(app):
     if is_dual_stack:
         listen_addr = f"0.0.0.0 / [::]:{PORT} (全接口双栈)"
     elif is_loopback:
-        listen_addr = f"127.0.0.1 + [::1]:{PORT} (本地双栈回环，防公网暴露)"
+        v6_suffix = " + [::1]" if check_ipv6_loopback() else ""
+        listen_addr = f"127.0.0.1{v6_suffix}:{PORT} (本地双栈回环，防公网暴露)"
     else:
         listen_addr = f"{HOST}:{PORT}"
     print("====================================================")

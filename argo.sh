@@ -1307,6 +1307,9 @@ uninstall_argo() {
     rm -rf "$APP_DIR"
     rm -f "$BIN_LINK" "$BIN_LINK_AG"
     rm -rf "$HOME/.argo-core"
+    if [[ -L /usr/local/bin/cloudflared ]] && [[ "$(readlink /usr/local/bin/cloudflared 2>/dev/null)" == *"argo-core"* ]]; then
+        rm -f /usr/local/bin/cloudflared
+    fi
 
     # 若残留 NAT64 注入，一并清理复原
     nat64_restore_temp

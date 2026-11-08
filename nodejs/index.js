@@ -378,7 +378,12 @@ blockList.addSubnet('198.51.100.0', 24);
 blockList.addSubnet('203.0.113.0', 24);
 
 function extractIpv4FromNat64(ipStr) {
-  const lower = ipStr.toLowerCase().trim();
+  let lower;
+  try {
+    lower = new URL(`http://[${ipStr.trim().replace(/^\[|\]$/g, '')}]`).hostname.slice(1, -1);
+  } catch {
+    return null;
+  }
   if (!lower.startsWith('64:ff9b::')) return null;
   const rest = lower.slice('64:ff9b::'.length);
   if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(rest)) {
@@ -1525,7 +1530,7 @@ function verifyBinary(binPath, flag) {
         fs.closeSync(fd);
         if (os.platform() === 'win32') {
           if (buf[0] !== 0x4d || buf[1] !== 0x5a) return false;
-        } else {
+        } else if (os.platform() === 'linux') {
           if (buf[0] !== 0x7f || buf[1] !== 0x45 || buf[2] !== 0x4c || buf[3] !== 0x46) return false;
         }
       }
