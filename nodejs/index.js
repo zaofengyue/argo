@@ -219,8 +219,7 @@ function setupContainerUptime() {
     uptimeTimer = setInterval(() => {
       const elapsed = Math.floor(Date.now() / 1000) - startTime;
       try {
-        fs.writeFileSync(fakeFile + '.tmp', `${elapsed}.00 ${elapsed}.00\n`);
-        fs.renameSync(fakeFile + '.tmp', fakeFile);
+        fs.writeFileSync(fakeFile, `${elapsed}.00 ${elapsed}.00\n`);
       } catch {}
     }, 2000);
     uptimeTimer.unref();
@@ -690,6 +689,7 @@ function handleXhttpSession(req, res, pathParts, protocol) {
       'Connection': 'keep-alive',
       'X-Accel-Buffering': 'no'
     });
+    if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
     if (session.protocol === 'vless' && session.isConnected && !session.handshakeSent) {
       res.write(Buffer.from([0, 0]));
@@ -711,7 +711,9 @@ function handleXhttpSession(req, res, pathParts, protocol) {
     });
 
     res.on('close', () => {
-      cleanupXhttpSession(sessionId);
+      if (session.downlinkRes === res) {
+        cleanupXhttpSession(sessionId);
+      }
     });
     return;
   }
@@ -1033,8 +1035,9 @@ try {
 }
 
 if (WebSocket) {
-  const wssVless  = new WebSocket.Server({ noServer: true });
-  const wssTrojan = new WebSocket.Server({ noServer: true });
+  const WS_MAX_PAYLOAD = 2 * 1024 * 1024;
+  const wssVless  = new WebSocket.Server({ noServer: true, maxPayload: WS_MAX_PAYLOAD });
+  const wssTrojan = new WebSocket.Server({ noServer: true, maxPayload: WS_MAX_PAYLOAD });
 
   server.on('upgrade', (req, socket, head) => {
     const reqUrl = req.url.split('?')[0];
@@ -1053,8 +1056,15 @@ if (WebSocket) {
     let pendingChunks = [];
     let pendingChunksBytes = 0;
     const MAX_PENDING_BYTES = 1024 * 1024;
+    let handshakeTimer = setTimeout(() => {
+      if (!isHeaderParsed && !isWsClosed) {
+        isWsClosed = true;
+        try { ws.close(1008, 'Handshake timeout'); } catch {}
+      }
+    }, 15000);
 
     const onEarlyDisconnect = () => {
+      if (handshakeTimer) { clearTimeout(handshakeTimer); handshakeTimer = null; }
       isWsClosed = true;
       pendingChunks = [];
       pendingChunksBytes = 0;
@@ -1068,8 +1078,13 @@ if (WebSocket) {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       if (!isHeaderParsed) {
         const parsed = parseVlessHeader(buffer);
-        if (!parsed) { ws.close(); return; }
+        if (!parsed) {
+          if (handshakeTimer) { clearTimeout(handshakeTimer); handshakeTimer = null; }
+          ws.close();
+          return;
+        }
         isHeaderParsed = true;
+        if (handshakeTimer) { clearTimeout(handshakeTimer); handshakeTimer = null; }
         const sock = resolveAndConnect(parsed.targetHost, parsed.targetPort, (connectedSock) => {
           if (isWsClosed || ws.readyState !== WebSocket.OPEN) {
             connectedSock.on('error', () => {});
@@ -1122,8 +1137,15 @@ if (WebSocket) {
     let pendingChunks = [];
     let pendingChunksBytes = 0;
     const MAX_PENDING_BYTES = 1024 * 1024;
+    let handshakeTimer = setTimeout(() => {
+      if (!isHeaderParsed && !isWsClosed) {
+        isWsClosed = true;
+        try { ws.close(1008, 'Handshake timeout'); } catch {}
+      }
+    }, 15000);
 
     const onEarlyDisconnect = () => {
+      if (handshakeTimer) { clearTimeout(handshakeTimer); handshakeTimer = null; }
       isWsClosed = true;
       pendingChunks = [];
       pendingChunksBytes = 0;
@@ -1137,8 +1159,13 @@ if (WebSocket) {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       if (!isHeaderParsed) {
         const parsed = parseTrojanHeader(buffer);
-        if (!parsed) { ws.close(); return; }
+        if (!parsed) {
+          if (handshakeTimer) { clearTimeout(handshakeTimer); handshakeTimer = null; }
+          ws.close();
+          return;
+        }
         isHeaderParsed = true;
+        if (handshakeTimer) { clearTimeout(handshakeTimer); handshakeTimer = null; }
         const sock = resolveAndConnect(parsed.targetHost, parsed.targetPort, (connectedSock) => {
           if (isWsClosed || ws.readyState !== WebSocket.OPEN) {
             connectedSock.on('error', () => {});
@@ -1352,35 +1379,65 @@ function displayNodeInfo(host) {
   }
 }
 
-// ── 5. 通用下载工具（带 302 重定向跟随、超时及协议安全适配）──────────────
-function downloadBinary(url, dest, maxRedirects = 5, timeoutMs = 15000) {
+// ── 5. 通用下载工具（带 302 重定向跟随、动态空闲超时及协议安全适配）──────────────
+function downloadBinary(url, dest, maxRedirects = 5, idleTimeoutMs = 30000, totalTimeoutMs = 180000) {
   return new Promise((resolve, reject) => {
-    let timer = null;
+    let idleTimer = null;
+    let totalTimer = null;
     let fileStream = null;
+    let activeReq = null;
+    let settled = false;
 
     const cleanup = () => {
-      if (timer) clearTimeout(timer);
+      if (idleTimer) clearTimeout(idleTimer);
+      if (totalTimer) clearTimeout(totalTimer);
       if (fileStream) {
         try { fileStream.destroy(); } catch {}
         try { if (fs.existsSync(dest)) fs.unlinkSync(dest); } catch {}
       }
     };
 
+    const safeReject = (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err);
+    };
+
+    const safeResolve = (val) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(val);
+    };
+
+    const resetIdleTimer = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        if (activeReq) activeReq.destroy();
+        safeReject(new Error(`Download idle timeout (${idleTimeoutMs / 1000}s without data)`));
+      }, idleTimeoutMs);
+    };
+
+    totalTimer = setTimeout(() => {
+      if (activeReq) activeReq.destroy();
+      safeReject(new Error(`Download total timeout (${totalTimeoutMs / 1000}s)`));
+    }, totalTimeoutMs);
+
     const handleReq = (currUrl, redirectsLeft) => {
       if (redirectsLeft < 0) {
-        cleanup();
-        return reject(new Error('Too many redirects'));
+        return safeReject(new Error('Too many redirects'));
       }
       let parsedUrl;
       try {
         parsedUrl = new URL(currUrl);
       } catch (e) {
-        cleanup();
-        return reject(e);
+        return safeReject(e);
       }
       const client = parsedUrl.protocol === 'http:' ? http : https;
 
-      const req = client.get(currUrl, { timeout: timeoutMs }, (res) => {
+      resetIdleTimer();
+      const req = client.get(currUrl, (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           const nextUrl = new URL(res.headers.location, currUrl).href;
           res.resume();
@@ -1388,39 +1445,24 @@ function downloadBinary(url, dest, maxRedirects = 5, timeoutMs = 15000) {
         }
         if (res.statusCode !== 200) {
           res.resume();
-          cleanup();
-          return reject(new Error(`HTTP ${res.statusCode}`));
+          return safeReject(new Error(`HTTP ${res.statusCode}`));
         }
         fileStream = fs.createWriteStream(dest);
+        res.on('data', () => resetIdleTimer());
+        res.on('error', (err) => safeReject(err));
         res.pipe(fileStream);
         fileStream.on('finish', () => {
           fileStream.close(() => {
-            if (timer) clearTimeout(timer);
             try { fs.chmodSync(dest, 0o755); } catch {}
-            resolve(dest);
+            safeResolve(dest);
           });
         });
-        fileStream.on('error', (err) => {
-          cleanup();
-          reject(err);
-        });
+        fileStream.on('error', (err) => safeReject(err));
       });
 
-      req.on('error', (err) => {
-        cleanup();
-        reject(err);
-      });
-      req.on('timeout', () => {
-        req.destroy();
-        cleanup();
-        reject(new Error(`Download timeout (${timeoutMs}ms)`));
-      });
+      activeReq = req;
+      req.on('error', (err) => safeReject(err));
     };
-
-    timer = setTimeout(() => {
-      cleanup();
-      reject(new Error(`Download timeout (${timeoutMs}ms)`));
-    }, timeoutMs);
 
     handleReq(url, maxRedirects);
   });
@@ -1683,20 +1725,26 @@ const onListening = () => {
   startKomari();
 };
 
+server.once('listening', onListening);
+
 if (isDualStack) {
   let fallback = false;
-  server.listen({ port: PORT, host: '::', ipv6Only: false }, onListening)
-    .once('error', (err) => {
+  server.listen({ port: PORT, host: '::', ipv6Only: false })
+    .on('error', (err) => {
       if (!fallback && (err.code === 'EAFNOSUPPORT' || err.code === 'EADDRNOTAVAIL')) {
         fallback = true;
         console.log('[网络] 系统未启用 IPv6，自动降级至 IPv4 0.0.0.0 监听');
-        server.listen(PORT, '0.0.0.0', onListening);
+        server.listen(PORT, '0.0.0.0');
       } else {
-        throw err;
+        console.error(`[致命错误] 端口 ${PORT} 监听失败: ${err.message}`);
+        process.exit(1);
       }
     });
 } else {
-  server.listen(PORT, HOST, onListening);
+  server.listen(PORT, HOST).once('error', (err) => {
+    console.error(`[致命错误] 监听 ${HOST}:${PORT} 失败: ${err.message}`);
+    process.exit(1);
+  });
 }
 
 // ── 10. 优雅退出与孤儿清理 ───────────────────────────────────────────────────

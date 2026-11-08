@@ -83,7 +83,7 @@ ensure_bin_path() {
     fi
 }
 
-# ── 下载双引擎容灾封装 (curl / wget 互备，自动防 CDN 缓存) ──────────────
+# ── 下载双引擎容灾封装 (curl / wget 互备，原子写入防残损) ──────────────
 fetch_file() {
     local url="$1"
     local dest="$2"
@@ -95,11 +95,23 @@ fetch_file() {
         url="${url}?_t=${ts}"
     fi
 
+    local tmp_dest="${dest}.tmp.$$"
+    local ok=0
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL -H "Cache-Control: no-cache, no-store, must-revalidate" -H "Pragma: no-cache" "$url" -o "$dest" 2>/dev/null
+        if curl -fsSL -H "Cache-Control: no-cache, no-store, must-revalidate" -H "Pragma: no-cache" "$url" -o "$tmp_dest" 2>/dev/null; then
+            ok=1
+        fi
     elif command -v wget >/dev/null 2>&1; then
-        wget -q --no-cache -O "$dest" "$url" 2>/dev/null
+        if wget -q --no-cache -O "$tmp_dest" "$url" 2>/dev/null; then
+            ok=1
+        fi
+    fi
+
+    if [[ "$ok" -eq 1 && -s "$tmp_dest" ]]; then
+        mv -f "$tmp_dest" "$dest"
+        return 0
     else
+        rm -f "$tmp_dest" 2>/dev/null || true
         return 1
     fi
 }
@@ -109,7 +121,7 @@ check_port_available() {
     local port="$1"
     [[ -z "$port" ]] && return 0
     local argo_pid
-    argo_pid=$(pgrep -f "node index.js" | head -1)
+    argo_pid=$(pgrep -f "$APP_DIR/nodejs/index.js" | head -1)
 
     if command -v ss >/dev/null 2>&1; then
         local line
@@ -497,7 +509,7 @@ quick_install_wizard() {
     echo -e "${CYAN}====================================================${NC}\n"
 
     local is_unattended=0
-    if [[ -n "${UUID:-}" || -n "${PASSWORD:-}" || -n "${PORT:-}" || -n "${NAME:-}" || -n "${ARGO_DOMAIN:-}" || -n "${ARGO_AUTH:-}" || -n "${CF_PREFER_HOST:-}" || -n "${KOMARI_DOMAIN:-}" ]]; then
+    if [[ -n "${UUID:-}" || -n "${PASSWORD:-}" || -n "${PORT:-}" || -n "${ARGO_DOMAIN:-}" || -n "${ARGO_AUTH:-}" || -n "${CF_PREFER_HOST:-}" || -n "${KOMARI_DOMAIN:-}" ]]; then
         is_unattended=1
         log_info "检测到外部传入的环境变量，启用无人值守静默配置模式..."
     fi
@@ -1173,7 +1185,7 @@ uninstall_argo() {
     pkill -u "$(id -u)" -f "\.argo-core/metrics" 2>/dev/null || true
     pkill -u "$(id -u)" -f "node /app/bridge.js" 2>/dev/null || true
     pkill -u "$(id -u)" -f "node /app/metrics.js" 2>/dev/null || true
-    pkill -u "$(id -u)" -f "node.*index.js" 2>/dev/null || true
+    pkill -u "$(id -u)" -f "$APP_DIR/nodejs/index.js" 2>/dev/null || true
 
     rm -rf "$APP_DIR"
     rm -f "$BIN_LINK" "$BIN_LINK_AG"
@@ -1345,8 +1357,8 @@ if [[ -n "$1" ]]; then
             ;;
     esac
 else
-    # 无参数时：若检测到传入了外部环境变量，则直接触发无人值守一键安装
-    if [[ -n "${UUID:-}" || -n "${PASSWORD:-}" || -n "${PORT:-}" || -n "${NAME:-}" || -n "${ARGO_DOMAIN:-}" || -n "${ARGO_AUTH:-}" ]]; then
+    # 无参数时：若检测到传入了核心环境变量，则直接触发无人值守一键安装
+    if [[ -n "${UUID:-}" || -n "${PASSWORD:-}" || -n "${PORT:-}" || -n "${ARGO_DOMAIN:-}" || -n "${ARGO_AUTH:-}" ]]; then
         do_install
         exit 0
     fi

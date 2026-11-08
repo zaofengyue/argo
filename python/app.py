@@ -163,6 +163,7 @@ def handle_global_exception(loop, context):
 
 UUID_BYTES = bytes.fromhex(UUID.replace('-', ''))
 TROJAN_HASH_STR = hashlib.sha224(PASSWORD.encode('utf-8')).hexdigest().lower()
+TROJAN_HASH_BYTES = TROJAN_HASH_STR.encode('ascii')
 
 HTML_FILE = Path(__file__).parent / 'index.html'
 CAMOUFLAGE_HTML = '<!DOCTYPE html><html><head><title>Welcome</title></head><body><h1>Service Active</h1></body></html>'
@@ -239,9 +240,7 @@ async def setup_container_uptime():
         while not is_shutting_down:
             await asyncio.sleep(2)
             elapsed = int(time.time()) - start_time
-            tmp_file = fake_file.with_suffix('.tmp')
-            tmp_file.write_text(f'{elapsed}.00 {elapsed}.00\n')
-            tmp_file.replace(fake_file)
+            fake_file.write_text(f'{elapsed}.00 {elapsed}.00\n')
     except Exception:
         pass
 
@@ -306,8 +305,8 @@ def parse_vless_header(buf: bytes):
 def parse_trojan_header(buf: bytes):
     if not isinstance(buf, (bytes, bytearray)) or len(buf) < 62:
         return None
-    req_hash = buf[:56].decode('utf-8', errors='ignore').lower()
-    if not hmac.compare_digest(req_hash, TROJAN_HASH_STR):
+    req_hash = bytes(buf[:56]).lower()
+    if not hmac.compare_digest(req_hash, TROJAN_HASH_BYTES):
         return None
     if buf[56] != 0x0D or buf[57] != 0x0A:
         return None
@@ -625,7 +624,7 @@ async def start_argo_tunnel(local_port: int):
             if notified:
                 return
             notified = True
-            if fallback_task and not fallback_task.done():
+            if fallback_task and not fallback_task.done() and asyncio.current_task() != fallback_task:
                 fallback_task.cancel()
             global node_name_task
             if node_name_task and not node_name_task.done():
@@ -1320,15 +1319,25 @@ async def handle_trojan_xhttp(request):
 
 @routes.get(PATH_VLESS)
 async def handle_vless_ws(request):
-    ws = web.WebSocketResponse()
+    ws = web.WebSocketResponse(max_msg_size=2 * 1024 * 1024)
     await ws.prepare(request)
 
     r_writer = None
+    async def handshake_timeout():
+        await asyncio.sleep(15)
+        if not r_writer and not ws.closed:
+            try:
+                await ws.close(code=1008, message=b'Handshake timeout')
+            except Exception:
+                pass
+
+    timeout_task = asyncio.create_task(handshake_timeout())
     try:
         async for msg in ws:
             if msg.type == WSMsgType.BINARY:
                 data = msg.data
                 if not r_writer:
+                    timeout_task.cancel()
                     parsed = parse_vless_header(data)
                     if not parsed:
                         await ws.close()
@@ -1361,6 +1370,7 @@ async def handle_vless_ws(request):
             elif msg.type in (WSMsgType.CLOSE, WSMsgType.ERROR):
                 break
     finally:
+        timeout_task.cancel()
         if r_writer:
             try:
                 r_writer.close()
@@ -1371,15 +1381,25 @@ async def handle_vless_ws(request):
 
 @routes.get(PATH_TROJAN)
 async def handle_trojan_ws(request):
-    ws = web.WebSocketResponse()
+    ws = web.WebSocketResponse(max_msg_size=2 * 1024 * 1024)
     await ws.prepare(request)
 
     r_writer = None
+    async def handshake_timeout():
+        await asyncio.sleep(15)
+        if not r_writer and not ws.closed:
+            try:
+                await ws.close(code=1008, message=b'Handshake timeout')
+            except Exception:
+                pass
+
+    timeout_task = asyncio.create_task(handshake_timeout())
     try:
         async for msg in ws:
             if msg.type == WSMsgType.BINARY:
                 data = msg.data
                 if not r_writer:
+                    timeout_task.cancel()
                     parsed = parse_trojan_header(data)
                     if not parsed:
                         await ws.close()
@@ -1411,6 +1431,7 @@ async def handle_trojan_ws(request):
             elif msg.type in (WSMsgType.CLOSE, WSMsgType.ERROR):
                 break
     finally:
+        timeout_task.cancel()
         if r_writer:
             try:
                 r_writer.close()
