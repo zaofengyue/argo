@@ -293,6 +293,7 @@ svc_stop() {
         fi
         kill_argo_processes
         pkill -u "$(id -u)" -f "node /app/bridge.js" 2>/dev/null || true
+        pkill -u "$(id -u)" -f "node /app/metrics.js" 2>/dev/null || true
     fi
 }
 
@@ -636,6 +637,7 @@ quick_install_wizard() {
     local def_listen_host="${LISTEN_HOST:-$(get_env "LISTEN_HOST")}"
     [[ -z "$def_listen_host" ]] && def_listen_host="127.0.0.1"
     set_env "LISTEN_HOST" "$def_listen_host"
+    set_env "LISTEN_HOST_MIGRATED" "1"
 
     # 4. 节点名称
     local def_name="${NAME:-$(get_env "NAME")}"
@@ -973,7 +975,6 @@ download_cloudflared() {
     local base_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${cf_arch}"
     local mirrors=(
         "$base_url"
-        "https://ghfast.top/${base_url}"
         "https://ghproxy.net/${base_url}"
     )
 
@@ -983,12 +984,21 @@ download_cloudflared() {
 
     for u in "${mirrors[@]}"; do
         if fetch_file "$u" "$tmp_cf" && [[ -s "$tmp_cf" ]]; then
-            chmod +x "$tmp_cf" 2>/dev/null || true
-            if "$tmp_cf" --version >/dev/null 2>&1; then
-                mv -f "$tmp_cf" "$cf_bin"
-                chmod +x "$cf_bin" 2>/dev/null || true
-                success=1
-                break
+            local file_size
+            file_size=$(wc -c < "$tmp_cf" 2>/dev/null || stat -c%s "$tmp_cf" 2>/dev/null || echo 0)
+            # 基础文件体积门禁 (cloudflared 二进制通常 >= 15MB) 与 ELF 魔数校验
+            if [[ "$file_size" -ge 15728640 ]]; then
+                local magic
+                magic=$(head -c 4 "$tmp_cf" 2>/dev/null)
+                if [[ "$magic" == $'\x7fELF' ]]; then
+                    chmod +x "$tmp_cf" 2>/dev/null || true
+                    if "$tmp_cf" --version >/dev/null 2>&1; then
+                        mv -f "$tmp_cf" "$cf_bin"
+                        chmod +x "$cf_bin" 2>/dev/null || true
+                        success=1
+                        break
+                    fi
+                fi
             fi
         fi
         rm -f "$tmp_cf" 2>/dev/null || true
@@ -997,7 +1007,9 @@ download_cloudflared() {
     if [[ "$success" -eq 1 ]]; then
         log_info "cloudflared 穿透核心预下载成功并验证通过！"
         if [[ "$(id -u 2>/dev/null || echo 1)" -eq 0 ]]; then
-            ln -sf "$cf_bin" /usr/local/bin/cloudflared 2>/dev/null || true
+            if [[ ! -e /usr/local/bin/cloudflared || -L /usr/local/bin/cloudflared ]]; then
+                ln -sf "$cf_bin" /usr/local/bin/cloudflared 2>/dev/null || true
+            fi
         fi
         return 0
     else

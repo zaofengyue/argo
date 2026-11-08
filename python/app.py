@@ -513,6 +513,20 @@ def detect_arch():
 
 def verify_binary(bin_path: Path, flag: str) -> bool:
     try:
+        p = Path(bin_path)
+        if p.exists() and p.is_file():
+            # 基础文件体积门禁 (杜绝空文件或下载到网页错误文本)
+            if p.stat().st_size < 500 * 1024:
+                return False
+            # 头部魔数校验 (Linux ELF 或 Windows MZ，杜绝执行非二进制脚本/HTML)
+            with open(p, 'rb') as f:
+                magic = f.read(4)
+            if platform.system().lower() == 'windows':
+                if not magic.startswith(b'MZ'):
+                    return False
+            else:
+                if magic != b'\x7fELF':
+                    return False
         res = subprocess.run([str(bin_path), flag], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
         return res.returncode == 0 or len(res.stdout) > 0 or len(res.stderr) > 0
     except Exception:
@@ -556,7 +570,6 @@ async def ensure_cloudflared() -> Path | None:
     base_suffix = f"cloudflared-{suffix}"
     urls = [
         f"https://github.com/cloudflare/cloudflared/releases/latest/download/{base_suffix}",
-        f"https://ghfast.top/https://github.com/cloudflare/cloudflared/releases/latest/download/{base_suffix}",
         f"https://ghproxy.net/https://github.com/cloudflare/cloudflared/releases/latest/download/{base_suffix}"
     ]
 
@@ -602,7 +615,6 @@ async def ensure_komari_agent() -> Path | None:
     filename = f"komari-agent-{os_type}-{arch}{EXT}"
     urls = [
         f"https://github.com/komari-monitor/komari-agent/releases/latest/download/{filename}",
-        f"https://ghfast.top/https://github.com/komari-monitor/komari-agent/releases/latest/download/{filename}",
         f"https://ghproxy.net/https://github.com/komari-monitor/komari-agent/releases/latest/download/{filename}"
     ]
 
@@ -809,7 +821,6 @@ BLOCKED_NETWORKS = [
     ipaddress.ip_network('127.0.0.0/8'),
     ipaddress.ip_network('169.254.0.0/16'),
     ipaddress.ip_network('100.64.0.0/10'),
-    ipaddress.ip_network('64:ff9b::/96'),
     ipaddress.ip_network('2002::/16'),
     ipaddress.ip_network('198.18.0.0/15'),
     ipaddress.ip_network('192.0.0.0/24'),
@@ -829,6 +840,12 @@ def is_ip_blocked(ip_obj) -> bool:
     # 归一化 IPv4-mapped IPv6 地址 (如 ::ffff:10.0.0.1 -> 10.0.0.1)
     if ip_obj.version == 6 and ip_obj.ipv4_mapped:
         ip_obj = ip_obj.ipv4_mapped
+
+    # RFC 6052 NAT64 网段智能校验：提取内嵌的真实 32 位 IPv4 地址递归校验，严禁误杀公网 IPv4
+    if ip_obj.version == 6 and ip_obj in ipaddress.ip_network('64:ff9b::/96'):
+        v4_int = int(ip_obj) & 0xffffffff
+        v4_obj = ipaddress.IPv4Address(v4_int)
+        return is_ip_blocked(v4_obj)
 
     if ip_obj.is_multicast or ip_obj.is_unspecified or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_reserved:
         return True
@@ -1103,12 +1120,11 @@ async def process_xhttp_uplink(sess: dict, data: bytes, seq: int = None):
         sess['pending_uplink_map'][seq] = data
         sess['pending_uplink_bytes'] = sess.get('pending_uplink_bytes', 0) + data_len
 
-@routes.get(f"{PATH_XHTTP}/{{session_id}}")
-async def handle_vless_xhttp_get(request):
+async def handle_xhttp_get_common(request, protocol: str):
     if not ARGO_DOMAIN:
         return web.Response(status=404, text="Not Found")
     session_id = request.match_info['session_id']
-    sess = get_or_create_xhttp_session(session_id, 'vless')
+    sess = get_or_create_xhttp_session(session_id, protocol)
     if not sess:
         return web.Response(status=400, text="Bad Request")
     resp = web.StreamResponse(status=200, headers={
@@ -1119,17 +1135,38 @@ async def handle_vless_xhttp_get(request):
         'X-Accel-Buffering': 'no'
     })
     await resp.prepare(request)
+
+    # 若已有旧 GET 下行响应，通知其退出，由当前最新 GET 无缝平替
+    old_stop = sess.get('active_downlink_stop')
+    if old_stop and not old_stop.is_set():
+        old_stop.set()
+
+    stop_event = asyncio.Event()
+    sess['active_downlink_stop'] = stop_event
+    sess['active_downlink_resp'] = resp
+
     try:
-        while not sess['closed']:
-            data = await sess['downlink_queue'].get()
+        while not sess['closed'] and not stop_event.is_set():
+            try:
+                data = await asyncio.wait_for(sess['downlink_queue'].get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
             if data is None:
                 break
             await resp.write(data)
     except Exception:
         pass
     finally:
-        await cleanup_xhttp_session(session_id)
+        # 仅当整条会话已关闭，或当前响应仍是活跃下行且已作废时才清理会话，严禁旧 GET 断连误杀新会话
+        if sess.get('active_downlink_resp') is resp:
+            sess['active_downlink_resp'] = None
+            if sess.get('closed'):
+                await cleanup_xhttp_session(session_id)
     return resp
+
+@routes.get(f"{PATH_XHTTP}/{{session_id}}")
+async def handle_vless_xhttp_get(request):
+    return await handle_xhttp_get_common(request, 'vless')
 
 @routes.post(f"{PATH_XHTTP}/{{session_id}}")
 @routes.post(f"{PATH_XHTTP}/{{session_id}}/{{seq}}")
@@ -1149,31 +1186,7 @@ async def handle_vless_xhttp_post(request):
 
 @routes.get(f"{PATH_TROJAN_XHTTP}/{{session_id}}")
 async def handle_trojan_xhttp_get(request):
-    if not ARGO_DOMAIN:
-        return web.Response(status=404, text="Not Found")
-    session_id = request.match_info['session_id']
-    sess = get_or_create_xhttp_session(session_id, 'trojan')
-    if not sess:
-        return web.Response(status=400, text="Bad Request")
-    resp = web.StreamResponse(status=200, headers={
-        'Content-Type': 'application/octet-stream',
-        'Transfer-Encoding': 'chunked',
-        'Cache-Control': 'no-cache, no-store, no-transform',
-        'Connection': 'keep-alive',
-        'X-Accel-Buffering': 'no'
-    })
-    await resp.prepare(request)
-    try:
-        while not sess['closed']:
-            data = await sess['downlink_queue'].get()
-            if data is None:
-                break
-            await resp.write(data)
-    except Exception:
-        pass
-    finally:
-        await cleanup_xhttp_session(session_id)
-    return resp
+    return await handle_xhttp_get_common(request, 'trojan')
 
 @routes.post(f"{PATH_TROJAN_XHTTP}/{{session_id}}")
 @routes.post(f"{PATH_TROJAN_XHTTP}/{{session_id}}/{{seq}}")
@@ -1502,6 +1515,10 @@ async def on_cleanup(app):
     global is_shutting_down
     is_shutting_down = True
     print("\n[安全退出] 正在清理子进程并释放资源...")
+    try:
+        SUB_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
     for sid in list(xhttp_sessions.keys()):
         try:
             await cleanup_xhttp_session(sid)
@@ -1532,7 +1549,7 @@ def main():
 
     if is_loopback:
         async def run_dual_loopback():
-            runner = web.AppRunner(app)
+            runner = web.AppRunner(app, shutdown_timeout=3.0)
             await runner.setup()
             site_v4 = web.TCPSite(runner, '127.0.0.1', PORT)
             await site_v4.start()
@@ -1562,7 +1579,7 @@ def main():
             pass
     else:
         run_host = None if is_dual_stack else LISTEN_HOST
-        web.run_app(app, host=run_host, port=PORT)
+        web.run_app(app, host=run_host, port=PORT, shutdown_timeout=3.0)
 
 if __name__ == '__main__':
     main()

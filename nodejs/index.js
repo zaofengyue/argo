@@ -366,8 +366,8 @@ if (!ALLOW_LAN) {
   blockList.addSubnet('fc00::', 7, 'ipv6');
 }
 
-// 5. 补充特异与保留网段 (NAT64, 6to4, 多播, 基准测试, TEST-NET, IETF保留)
-blockList.addSubnet('64:ff9b::', 96, 'ipv6');
+// 5. 补充特异与保留网段 (6to4, 多播, 基准测试, TEST-NET, IETF保留)
+// 注意：RFC 6052 NAT64 网段 64:ff9b::/96 由下文 extractIpv4FromNat64 进行内嵌 IPv4 智能校验，严禁在此全网段粗暴阻断
 blockList.addSubnet('2002::', 16, 'ipv6');
 blockList.addSubnet('224.0.0.0', 4);
 blockList.addSubnet('ff00::', 8, 'ipv6');
@@ -377,8 +377,30 @@ blockList.addSubnet('192.0.2.0', 24);
 blockList.addSubnet('198.51.100.0', 24);
 blockList.addSubnet('203.0.113.0', 24);
 
+function extractIpv4FromNat64(ipStr) {
+  const lower = ipStr.toLowerCase().trim();
+  if (!lower.startsWith('64:ff9b::')) return null;
+  const rest = lower.slice('64:ff9b::'.length);
+  if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(rest)) {
+    return rest;
+  }
+  const parts = rest.split(':');
+  if (parts.length === 2 && /^[0-9a-f]{1,4}$/i.test(parts[0]) && /^[0-9a-f]{1,4}$/i.test(parts[1])) {
+    const w1 = parseInt(parts[0], 16);
+    const w2 = parseInt(parts[1], 16);
+    return `${(w1 >> 8) & 0xff}.${w1 & 0xff}.${(w2 >> 8) & 0xff}.${w2 & 0xff}`;
+  }
+  return null;
+}
+
 function checkIpBlocked(ipStr, family = 'ipv4') {
   try {
+    if (family === 'ipv6') {
+      const v4Part = extractIpv4FromNat64(ipStr);
+      if (v4Part) {
+        return blockList.check(v4Part, 'ipv4');
+      }
+    }
     return blockList.check(ipStr, family);
   } catch {
     return true;
@@ -1491,6 +1513,23 @@ function detectArch() {
 
 function verifyBinary(binPath, flag) {
   try {
+    if (fs.existsSync(binPath)) {
+      const stat = fs.statSync(binPath);
+      if (stat.isFile()) {
+        // 基础文件体积门禁 (杜绝空文件或下载到网页错误文本)
+        if (stat.size < 500 * 1024) return false;
+        // 头部魔数校验 (Linux ELF 或 Windows MZ，杜绝执行非二进制脚本/HTML)
+        const fd = fs.openSync(binPath, 'r');
+        const buf = Buffer.alloc(4);
+        fs.readSync(fd, buf, 0, 4, 0);
+        fs.closeSync(fd);
+        if (os.platform() === 'win32') {
+          if (buf[0] !== 0x4d || buf[1] !== 0x5a) return false;
+        } else {
+          if (buf[0] !== 0x7f || buf[1] !== 0x45 || buf[2] !== 0x4c || buf[3] !== 0x46) return false;
+        }
+      }
+    }
     const out = spawnSync(binPath, [flag], { stdio: 'pipe', timeout: 3000 });
     return out.status === 0 || (out.stdout && out.stdout.length > 0) || (out.stderr && out.stderr.length > 0);
   } catch {
@@ -1522,7 +1561,6 @@ async function ensureCloudflared() {
   const baseSuffix = `cloudflared-${suffix}`;
   const urls = [
     `https://github.com/cloudflare/cloudflared/releases/latest/download/${baseSuffix}`,
-    `https://ghfast.top/https://github.com/cloudflare/cloudflared/releases/latest/download/${baseSuffix}`,
     `https://ghproxy.net/https://github.com/cloudflare/cloudflared/releases/latest/download/${baseSuffix}`
   ];
 
@@ -1569,7 +1607,6 @@ async function ensureKomariAgent() {
   const fileName = `komari-agent-${osType}-${arch}${ext}`;
   const urls = [
     `https://github.com/komari-monitor/komari-agent/releases/latest/download/${fileName}`,
-    `https://ghfast.top/https://github.com/komari-monitor/komari-agent/releases/latest/download/${fileName}`,
     `https://ghproxy.net/https://github.com/komari-monitor/komari-agent/releases/latest/download/${fileName}`
   ];
 
@@ -1736,7 +1773,8 @@ const isLoopbackOnly = LISTEN_HOST === '127.0.0.1' || LISTEN_HOST === 'localhost
 let v6Helper = null;
 
 const onListening = () => {
-  const listenAddr = isDualStackAll ? '0.0.0.0 / [::]' : (isLoopbackOnly ? '127.0.0.1 + [::1]' : HOST);
+  const isV6Listening = v6Helper && v6Helper.listening;
+  const listenAddr = isDualStackAll ? '0.0.0.0 / [::]' : (isLoopbackOnly ? (isV6Listening ? '127.0.0.1 + [::1]' : '127.0.0.1') : HOST);
   console.log(`====================================================`);
   console.log(`🚀 Argo (Zero-Binary 纯原生穿透引擎) 已启动`);
   console.log(`📡 内部监听: ${listenAddr}:${PORT} ${isDualStackAll ? '(全接口双栈)' : (isLoopbackOnly ? '(本地双栈回环，防公网暴露)' : '')}`);
@@ -1797,6 +1835,7 @@ function gracefulExit(sig) {
   if (isShuttingDown) return;
   isShuttingDown = true;
   console.log(`\n[安全退出] 收到 ${sig} 信号，正在清理子进程并释放资源...`);
+  try { if (fs.existsSync(SUB_FILE)) fs.unlinkSync(SUB_FILE); } catch {}
   for (const proc of trackedProcesses) {
     try { if (proc && !proc.killed) proc.kill('SIGTERM'); } catch {}
   }
