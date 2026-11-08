@@ -121,7 +121,8 @@ check_port_available() {
     local port="$1"
     [[ -z "$port" ]] && return 0
     local argo_pid
-    argo_pid=$(pgrep -f "$APP_DIR/nodejs/index.js" | head -1)
+    argo_pid=$(pgrep -f "$APP_DIR/nodejs/index.js" 2>/dev/null | head -1)
+    [[ -z "$argo_pid" ]] && argo_pid=$(pgrep -f "node index.js" 2>/dev/null | head -1)
 
     if command -v ss >/dev/null 2>&1; then
         local line
@@ -230,7 +231,7 @@ svc_start() {
                 source "$ENV_FILE" 2>/dev/null || true
                 set +a
             fi
-            nohup "$node_bin" index.js >> "$LOG_FILE" 2>&1 &
+            nohup "$node_bin" "$APP_DIR/nodejs/index.js" >> "$LOG_FILE" 2>&1 &
             echo $! > "$PID_FILE"
         )
     fi
@@ -255,6 +256,7 @@ svc_stop() {
             rm -f "$PID_FILE"
         fi
         pkill -u "$(id -u)" -f "$APP_DIR/nodejs/index.js" 2>/dev/null || true
+        pkill -u "$(id -u)" -f "node index.js" 2>/dev/null || true
         pkill -u "$(id -u)" -f "node /app/bridge.js" 2>/dev/null || true
     fi
 }
@@ -288,7 +290,7 @@ svc_is_active() {
                 return 0
             fi
         fi
-        pgrep -u "$(id -u)" -f "$APP_DIR/nodejs/index.js" >/dev/null 2>&1
+        pgrep -u "$(id -u)" -f "$APP_DIR/nodejs/index.js" >/dev/null 2>&1 || pgrep -u "$(id -u)" -f "node index.js" >/dev/null 2>&1
     else
         return 1
     fi
@@ -497,9 +499,9 @@ set_env() {
     printf '%s="%s"\n' "$key" "$escaped" >> "$ENV_FILE"
 }
 
-# 自动迁移旧版本 config.env 中的 LISTEN_HOST="127.0.0.1" 为 "0.0.0.0"
-if [[ -f "$ENV_FILE" ]] && [[ "$(get_env "LISTEN_HOST")" == "127.0.0.1" ]]; then
-    set_env "LISTEN_HOST" "0.0.0.0"
+# 自动迁移旧版本 config.env 中的 LISTEN_HOST="0.0.0.0" 恢复为安全的本地回环 "127.0.0.1" (VPS 模式)
+if [[ -f "$ENV_FILE" ]] && [[ "$(get_env "LISTEN_HOST")" == "0.0.0.0" ]]; then
+    set_env "LISTEN_HOST" "127.0.0.1"
 fi
 
 # ── 极速安装向导 (支持交互式与环境变量无人值守两种模式) ───────────────────────
@@ -593,7 +595,9 @@ quick_install_wizard() {
         fi
     fi
     set_env "PORT" "$final_port"
-    set_env "LISTEN_HOST" "0.0.0.0"
+    local def_listen_host="${LISTEN_HOST:-$(get_env "LISTEN_HOST")}"
+    [[ -z "$def_listen_host" || "$def_listen_host" == "0.0.0.0" ]] && def_listen_host="127.0.0.1"
+    set_env "LISTEN_HOST" "$def_listen_host"
 
     # 4. 节点名称
     local def_name="${NAME:-$(get_env "NAME")}"
@@ -950,7 +954,7 @@ Type=simple
 User=root
 WorkingDirectory=${APP_DIR}/nodejs
 EnvironmentFile=-${ENV_FILE}
-ExecStart=${node_bin} index.js
+ExecStart=${node_bin} "${APP_DIR}/nodejs/index.js"
 Restart=on-failure
 RestartSec=3s
 LimitNOFILE=65535
@@ -975,7 +979,7 @@ After=network.target
 Type=simple
 WorkingDirectory=${APP_DIR}/nodejs
 EnvironmentFile=-${ENV_FILE}
-ExecStart=${node_bin} index.js
+ExecStart=${node_bin} "${APP_DIR}/nodejs/index.js"
 Restart=on-failure
 RestartSec=3s
 LimitNOFILE=65535
@@ -999,7 +1003,7 @@ description="Argo Zero-Binary Proxy Service"
 directory="${APP_DIR}/nodejs"
 pidfile="/run/argo.pid"
 command="${node_bin}"
-command_args="index.js"
+command_args="${APP_DIR}/nodejs/index.js"
 command_background="yes"
 output_log="${OPENRC_LOG}"
 error_log="${OPENRC_LOG}"
@@ -1044,7 +1048,8 @@ check_status() {
     if svc_is_active; then
         echo -e "Argo 运行状态: ${GREEN}● 正在运行 (Active)${NC}"
         local pid
-        pid=$(pgrep -f "node index.js" | head -1)
+        pid=$(pgrep -f "$APP_DIR/nodejs/index.js" 2>/dev/null | head -1)
+        [[ -z "$pid" ]] && pid=$(pgrep -f "node index.js" 2>/dev/null | head -1)
         if [[ -n "$pid" ]]; then
             local mem
             mem=$(ps -p "$pid" -o rss= 2>/dev/null | awk '{print int($1/1024)"MB"}')
@@ -1186,6 +1191,7 @@ uninstall_argo() {
     pkill -u "$(id -u)" -f "node /app/bridge.js" 2>/dev/null || true
     pkill -u "$(id -u)" -f "node /app/metrics.js" 2>/dev/null || true
     pkill -u "$(id -u)" -f "$APP_DIR/nodejs/index.js" 2>/dev/null || true
+    pkill -u "$(id -u)" -f "node index.js" 2>/dev/null || true
 
     rm -rf "$APP_DIR"
     rm -f "$BIN_LINK" "$BIN_LINK_AG"

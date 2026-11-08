@@ -1441,7 +1441,8 @@ async def handle_trojan_ws(request):
     return ws
 
 # ── 启动与退出控制 ─────────────────────────────────────────────────────────
-is_dual_stack = not LISTEN_HOST or LISTEN_HOST in ('0.0.0.0', '::', '127.0.0.1', 'localhost')
+is_dual_stack = not LISTEN_HOST or LISTEN_HOST in ('0.0.0.0', '::')
+is_loopback = LISTEN_HOST in ('127.0.0.1', 'localhost')
 
 async def on_startup(app):
     loop = asyncio.get_running_loop()
@@ -1449,10 +1450,15 @@ async def on_startup(app):
 
     global node_name_task
     node_name_task = asyncio.create_task(resolve_node_name())
-    listen_addr = '0.0.0.0 / [::]' if is_dual_stack else HOST
+    if is_dual_stack:
+        listen_addr = f"0.0.0.0 / [::]:{PORT} (全接口双栈)"
+    elif is_loopback:
+        listen_addr = f"127.0.0.1:{PORT} (本地回环，防公网暴露)"
+    else:
+        listen_addr = f"{HOST}:{PORT}"
     print("====================================================")
     print("🚀 Argo (Zero-Binary 纯原生穿透引擎 - Python版) 已启动")
-    print(f"📡 内部监听: {listen_addr}:{PORT} (双栈兼容 localhost/127.0.0.1)")
+    print(f"📡 内部监听: {listen_addr}")
     if NODE_NAME:
         print(f"🏷️  节点标识: {NODE_NAME}")
     print(f"🔑 核心 UUID: {UUID}")
@@ -1495,7 +1501,7 @@ def main():
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
 
-    run_host = None if is_dual_stack else LISTEN_HOST
+    run_host = None if is_dual_stack else ('127.0.0.1' if is_loopback else LISTEN_HOST)
     web.run_app(app, host=run_host, port=PORT)
 
 if __name__ == '__main__':

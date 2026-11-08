@@ -1388,26 +1388,26 @@ function downloadBinary(url, dest, maxRedirects = 5, idleTimeoutMs = 30000, tota
     let activeReq = null;
     let settled = false;
 
-    const cleanup = () => {
+    const clearTimers = () => {
       if (idleTimer) clearTimeout(idleTimer);
       if (totalTimer) clearTimeout(totalTimer);
-      if (fileStream) {
-        try { fileStream.destroy(); } catch {}
-        try { if (fs.existsSync(dest)) fs.unlinkSync(dest); } catch {}
-      }
     };
 
     const safeReject = (err) => {
       if (settled) return;
       settled = true;
-      cleanup();
+      clearTimers();
+      if (fileStream) {
+        try { fileStream.destroy(); } catch {}
+        try { if (fs.existsSync(dest)) fs.unlinkSync(dest); } catch {}
+      }
       reject(err);
     };
 
     const safeResolve = (val) => {
       if (settled) return;
       settled = true;
-      cleanup();
+      clearTimers();
       resolve(val);
     };
 
@@ -1706,13 +1706,16 @@ async function startKomari() {
 // ── 9. 服务启动入口 ─────────────────────────────────────────────────────────
 killStaleByTag();
 
-const isDualStack = !LISTEN_HOST || LISTEN_HOST === '0.0.0.0' || LISTEN_HOST === '::' || LISTEN_HOST === '127.0.0.1' || LISTEN_HOST === 'localhost';
+const isDualStackAll = !LISTEN_HOST || LISTEN_HOST === '0.0.0.0' || LISTEN_HOST === '::';
+const isLoopbackOnly = LISTEN_HOST === '127.0.0.1' || LISTEN_HOST === 'localhost';
+
+let v6Helper = null;
 
 const onListening = () => {
-  const listenAddr = isDualStack ? '0.0.0.0 / [::]' : HOST;
+  const listenAddr = isDualStackAll ? '0.0.0.0 / [::]' : (isLoopbackOnly ? '127.0.0.1 + [::1]' : HOST);
   console.log(`====================================================`);
   console.log(`🚀 Argo (Zero-Binary 纯原生穿透引擎) 已启动`);
-  console.log(`📡 内部监听: ${listenAddr}:${PORT} (双栈兼容 localhost/127.0.0.1)`);
+  console.log(`📡 内部监听: ${listenAddr}:${PORT} ${isDualStackAll ? '(全接口双栈)' : (isLoopbackOnly ? '(本地双栈回环，防公网暴露)' : '')}`);
   if (NODE_NAME) {
     console.log(`🏷️  节点标识: ${NODE_NAME}`);
   }
@@ -1727,7 +1730,7 @@ const onListening = () => {
 
 server.once('listening', onListening);
 
-if (isDualStack) {
+if (isDualStackAll) {
   let fallback = false;
   server.listen({ port: PORT, host: '::', ipv6Only: false })
     .on('error', (err) => {
@@ -1740,6 +1743,24 @@ if (isDualStack) {
         process.exit(1);
       }
     });
+} else if (isLoopbackOnly) {
+  server.listen(PORT, '127.0.0.1').once('error', (err) => {
+    console.error(`[致命错误] 本地回环端口 ${PORT} 监听失败: ${err.message}`);
+    process.exit(1);
+  });
+  // 启动 IPv6 回环辅助监听，将 [::1]:PORT 转发至同一 http.Server，避免 cloudflared 解析 localhost 到 ::1 时连接失败
+  try {
+    v6Helper = net.createServer((sock) => {
+      server.emit('connection', sock);
+    });
+    v6Helper.on('error', () => {
+      try { v6Helper.close(); } catch {}
+      v6Helper = null;
+    });
+    v6Helper.listen(PORT, '::1');
+  } catch {
+    v6Helper = null;
+  }
 } else {
   server.listen(PORT, HOST).once('error', (err) => {
     console.error(`[致命错误] 监听 ${HOST}:${PORT} 失败: ${err.message}`);
@@ -1760,6 +1781,9 @@ function gracefulExit(sig) {
     clearInterval(uptimeTimer);
     try { execSync('umount /proc/uptime', { stdio: 'ignore' }); } catch {}
     try { fs.unlinkSync('/tmp/.fake_uptime'); } catch {}
+  }
+  if (v6Helper) {
+    try { v6Helper.close(); } catch {}
   }
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 1000);
