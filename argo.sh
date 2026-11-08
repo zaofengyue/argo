@@ -116,13 +116,49 @@ fetch_file() {
     fi
 }
 
+# ── Argo 专属进程定位与管理（精准匹配绝对路径，或兜底严格校验工作目录）─────────
+get_argo_pids() {
+    local pids=()
+    # 1. 优先匹配命令行包含完整绝对路径的现代进程
+    for p in $(pgrep -u "$(id -u)" -f "$APP_DIR/nodejs/index.js" 2>/dev/null); do
+        pids+=("$p")
+    done
+    # 2. 兜底匹配旧安装：必须严格验证进程工作目录是否为 $APP_DIR/nodejs，绝不误伤同机同名无关进程
+    for p in $(pgrep -u "$(id -u)" -f "node index.js" 2>/dev/null); do
+        local cwd
+        cwd=$(readlink "/proc/$p/cwd" 2>/dev/null || pwdx "$p" 2>/dev/null | awk '{print $2}')
+        if [[ "$cwd" == "$APP_DIR/nodejs" ]]; then
+            local already=0
+            for existing in "${pids[@]}"; do
+                [[ "$existing" == "$p" ]] && { already=1; break; }
+            done
+            [[ "$already" -eq 0 ]] && pids+=("$p")
+        fi
+    done
+    printf "%s\n" "${pids[@]}"
+}
+
+kill_argo_processes() {
+    local pids=()
+    for p in $(get_argo_pids); do
+        [[ -n "$p" ]] && pids+=("$p")
+    done
+    [[ ${#pids[@]} -eq 0 ]] && return 0
+    for p in "${pids[@]}"; do
+        kill "$p" 2>/dev/null || true
+    done
+    sleep 0.5
+    for p in "${pids[@]}"; do
+        kill -9 "$p" 2>/dev/null || true
+    done
+}
+
 # ── 本地端口可用性检测 ────────────────────────────────────────────────────────
 check_port_available() {
     local port="$1"
     [[ -z "$port" ]] && return 0
     local argo_pid
-    argo_pid=$(pgrep -f "$APP_DIR/nodejs/index.js" 2>/dev/null | head -1)
-    [[ -z "$argo_pid" ]] && argo_pid=$(pgrep -f "node index.js" 2>/dev/null | head -1)
+    argo_pid=$(get_argo_pids | head -1)
 
     if command -v ss >/dev/null 2>&1; then
         local line
@@ -255,8 +291,7 @@ svc_stop() {
             fi
             rm -f "$PID_FILE"
         fi
-        pkill -u "$(id -u)" -f "$APP_DIR/nodejs/index.js" 2>/dev/null || true
-        pkill -u "$(id -u)" -f "node index.js" 2>/dev/null || true
+        kill_argo_processes
         pkill -u "$(id -u)" -f "node /app/bridge.js" 2>/dev/null || true
     fi
 }
@@ -290,7 +325,7 @@ svc_is_active() {
                 return 0
             fi
         fi
-        pgrep -u "$(id -u)" -f "$APP_DIR/nodejs/index.js" >/dev/null 2>&1 || pgrep -u "$(id -u)" -f "node index.js" >/dev/null 2>&1
+        [[ -n "$(get_argo_pids | head -1)" ]]
     else
         return 1
     fi
@@ -499,9 +534,12 @@ set_env() {
     printf '%s="%s"\n' "$key" "$escaped" >> "$ENV_FILE"
 }
 
-# 自动迁移旧版本 config.env 中的 LISTEN_HOST="0.0.0.0" 恢复为安全的本地回环 "127.0.0.1" (VPS 模式)
-if [[ -f "$ENV_FILE" ]] && [[ "$(get_env "LISTEN_HOST")" == "0.0.0.0" ]]; then
-    set_env "LISTEN_HOST" "127.0.0.1"
+# 仅执行一次自动迁移：恢复被旧版脚本错误修改的 0.0.0.0 为默认安全的 127.0.0.1 (VPS 模式)
+if [[ -f "$ENV_FILE" ]] && [[ "$(get_env "LISTEN_HOST_MIGRATED")" != "1" ]]; then
+    if [[ "$(get_env "LISTEN_HOST")" == "0.0.0.0" ]]; then
+        set_env "LISTEN_HOST" "127.0.0.1"
+    fi
+    set_env "LISTEN_HOST_MIGRATED" "1"
 fi
 
 # ── 极速安装向导 (支持交互式与环境变量无人值守两种模式) ───────────────────────
@@ -596,7 +634,7 @@ quick_install_wizard() {
     fi
     set_env "PORT" "$final_port"
     local def_listen_host="${LISTEN_HOST:-$(get_env "LISTEN_HOST")}"
-    [[ -z "$def_listen_host" || "$def_listen_host" == "0.0.0.0" ]] && def_listen_host="127.0.0.1"
+    [[ -z "$def_listen_host" ]] && def_listen_host="127.0.0.1"
     set_env "LISTEN_HOST" "$def_listen_host"
 
     # 4. 节点名称
@@ -1048,8 +1086,7 @@ check_status() {
     if svc_is_active; then
         echo -e "Argo 运行状态: ${GREEN}● 正在运行 (Active)${NC}"
         local pid
-        pid=$(pgrep -f "$APP_DIR/nodejs/index.js" 2>/dev/null | head -1)
-        [[ -z "$pid" ]] && pid=$(pgrep -f "node index.js" 2>/dev/null | head -1)
+        pid=$(get_argo_pids | head -1)
         if [[ -n "$pid" ]]; then
             local mem
             mem=$(ps -p "$pid" -o rss= 2>/dev/null | awk '{print int($1/1024)"MB"}')
@@ -1190,8 +1227,7 @@ uninstall_argo() {
     pkill -u "$(id -u)" -f "\.argo-core/metrics" 2>/dev/null || true
     pkill -u "$(id -u)" -f "node /app/bridge.js" 2>/dev/null || true
     pkill -u "$(id -u)" -f "node /app/metrics.js" 2>/dev/null || true
-    pkill -u "$(id -u)" -f "$APP_DIR/nodejs/index.js" 2>/dev/null || true
-    pkill -u "$(id -u)" -f "node index.js" 2>/dev/null || true
+    kill_argo_processes
 
     rm -rf "$APP_DIR"
     rm -f "$BIN_LINK" "$BIN_LINK_AG"

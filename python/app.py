@@ -12,6 +12,7 @@ import hmac
 import asyncio
 import platform
 import subprocess
+import signal
 import urllib.parse
 import uuid
 import socket
@@ -1453,7 +1454,7 @@ async def on_startup(app):
     if is_dual_stack:
         listen_addr = f"0.0.0.0 / [::]:{PORT} (全接口双栈)"
     elif is_loopback:
-        listen_addr = f"127.0.0.1:{PORT} (本地回环，防公网暴露)"
+        listen_addr = f"127.0.0.1 + [::1]:{PORT} (本地双栈回环，防公网暴露)"
     else:
         listen_addr = f"{HOST}:{PORT}"
     print("====================================================")
@@ -1501,8 +1502,39 @@ def main():
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
 
-    run_host = None if is_dual_stack else ('127.0.0.1' if is_loopback else LISTEN_HOST)
-    web.run_app(app, host=run_host, port=PORT)
+    if is_loopback:
+        async def run_dual_loopback():
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site_v4 = web.TCPSite(runner, '127.0.0.1', PORT)
+            await site_v4.start()
+            try:
+                site_v6 = web.TCPSite(runner, '::1', PORT)
+                await site_v6.start()
+            except Exception:
+                pass
+
+            stop_event = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    loop.add_signal_handler(sig, stop_event.set)
+                except (NotImplementedError, AttributeError):
+                    pass
+            try:
+                await stop_event.wait()
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                pass
+            finally:
+                await runner.cleanup()
+
+        try:
+            asyncio.run(run_dual_loopback())
+        except (KeyboardInterrupt, SystemExit):
+            pass
+    else:
+        run_host = None if is_dual_stack else LISTEN_HOST
+        web.run_app(app, host=run_host, port=PORT)
 
 if __name__ == '__main__':
     main()
