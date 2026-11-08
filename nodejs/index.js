@@ -1437,7 +1437,12 @@ function downloadBinary(url, dest, maxRedirects = 5, idleTimeoutMs = 30000, tota
       const client = parsedUrl.protocol === 'http:' ? http : https;
 
       resetIdleTimer();
-      const req = client.get(currUrl, (res) => {
+      const req = client.get(currUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': '*/*'
+        }
+      }, (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           const nextUrl = new URL(res.headers.location, currUrl).href;
           res.resume();
@@ -1496,6 +1501,8 @@ function verifyBinary(binPath, flag) {
 async function ensureCloudflared() {
   const candidates = [
     CF_BIN_PATH,
+    path.join(__dirname, '..', '.argo-core', os.platform() === 'win32' ? 'bridge.exe' : 'bridge'),
+    '/root/.argo-core/bridge',
     '/opt/argo-core/bridge',
     'cloudflared',
     '/usr/local/bin/cloudflared',
@@ -1512,22 +1519,31 @@ async function ensureCloudflared() {
   const arch = detectArch();
   const ext = osType === 'windows' ? '.exe' : '';
   const suffix = `${osType}-${arch}${ext}`;
-  const url = `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${suffix}`;
+  const baseSuffix = `cloudflared-${suffix}`;
+  const urls = [
+    `https://github.com/cloudflare/cloudflared/releases/latest/download/${baseSuffix}`,
+    `https://ghfast.top/https://github.com/cloudflare/cloudflared/releases/latest/download/${baseSuffix}`,
+    `https://ghproxy.net/https://github.com/cloudflare/cloudflared/releases/latest/download/${baseSuffix}`
+  ];
 
   fs.mkdirSync(CORE_DIR, { recursive: true });
   console.log(`[Argo] 正在获取 cloudflared 穿透核心 (${suffix})...`);
-  try {
-    await downloadBinary(url, CF_BIN_PATH);
-    if (!verifyBinary(CF_BIN_PATH, '--version')) {
-      throw new Error('下载文件校验失败（损坏或不兼容）');
+  for (const u of urls) {
+    try {
+      await downloadBinary(u, CF_BIN_PATH);
+      if (verifyBinary(CF_BIN_PATH, '--version')) {
+        console.log('[Argo] cloudflared 准备就绪并通过验证');
+        return CF_BIN_PATH;
+      }
+      try { fs.unlinkSync(CF_BIN_PATH); } catch {}
+    } catch (err) {
+      let host = 'mirror';
+      try { host = new URL(u).hostname; } catch {}
+      console.warn(`[Argo] 从源 ${host} 下载 cloudflared 失败: ${err.message}`);
+      try { fs.unlinkSync(CF_BIN_PATH); } catch {}
     }
-    console.log('[Argo] cloudflared 准备就绪并通过验证');
-    return CF_BIN_PATH;
-  } catch (err) {
-    console.warn(`[Argo] 自动下载 cloudflared 失败: ${err.message}`);
-    try { fs.unlinkSync(CF_BIN_PATH); } catch {}
-    return null;
   }
+  return null;
 }
 
 async function ensureKomariAgent() {
@@ -1551,22 +1567,30 @@ async function ensureKomariAgent() {
 
   const ext = osType === 'windows' ? '.exe' : '';
   const fileName = `komari-agent-${osType}-${arch}${ext}`;
-  const url = `https://github.com/komari-monitor/komari-agent/releases/latest/download/${fileName}`;
+  const urls = [
+    `https://github.com/komari-monitor/komari-agent/releases/latest/download/${fileName}`,
+    `https://ghfast.top/https://github.com/komari-monitor/komari-agent/releases/latest/download/${fileName}`,
+    `https://ghproxy.net/https://github.com/komari-monitor/komari-agent/releases/latest/download/${fileName}`
+  ];
 
   fs.mkdirSync(CORE_DIR, { recursive: true });
   console.log(`[Komari] 正在下载监控探针 (${fileName})...`);
-  try {
-    await downloadBinary(url, KM_BIN_PATH);
-    if (!verifyBinary(KM_BIN_PATH, '--help')) {
-      throw new Error('探针文件校验失败');
+  for (const u of urls) {
+    try {
+      await downloadBinary(u, KM_BIN_PATH);
+      if (verifyBinary(KM_BIN_PATH, '--help')) {
+        console.log('[Komari] 监控探针准备就绪并通过验证');
+        return KM_BIN_PATH;
+      }
+      try { fs.unlinkSync(KM_BIN_PATH); } catch {}
+    } catch (err) {
+      let host = 'mirror';
+      try { host = new URL(u).hostname; } catch {}
+      console.warn(`[Komari] 从源 ${host} 下载探针失败: ${err.message}`);
+      try { fs.unlinkSync(KM_BIN_PATH); } catch {}
     }
-    console.log('[Komari] 监控探针准备就绪并通过验证');
-    return KM_BIN_PATH;
-  } catch (err) {
-    console.warn(`[Komari] 探针下载失败: ${err.message}`);
-    try { fs.unlinkSync(KM_BIN_PATH); } catch {}
-    return null;
   }
+  return null;
 }
 
 // ── 7. 启动 Argo 隧道（支持动态感知域名变更与守护保活）───────────────────────

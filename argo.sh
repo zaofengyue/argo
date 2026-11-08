@@ -946,6 +946,66 @@ config_menu() {
     done
 }
 
+# ── cloudflared 穿透核心架构探测与安装期预下载 ───────────────────────────────
+detect_cf_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64)   echo "linux-amd64" ;;
+        aarch64|arm64)  echo "linux-arm64" ;;
+        armv7l|armhf)   echo "linux-arm" ;;
+        i386|i686)      echo "linux-386" ;;
+        *)              echo "linux-amd64" ;;
+    esac
+}
+
+download_cloudflared() {
+    local cf_arch
+    cf_arch="$(detect_cf_arch)"
+    local core_dir="${HOME}/.argo-core"
+    local cf_bin="${core_dir}/bridge"
+    mkdir -p "$core_dir"
+
+    # 如果已有可用可执行核心且校验通过，直接跳过预下载
+    if [[ -x "$cf_bin" ]] && "$cf_bin" --version >/dev/null 2>&1; then
+        return 0
+    fi
+
+    log_info "正在预装 cloudflared 穿透核心 (${cf_arch})..."
+    local base_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${cf_arch}"
+    local mirrors=(
+        "$base_url"
+        "https://ghfast.top/${base_url}"
+        "https://ghproxy.net/${base_url}"
+    )
+
+    local success=0
+    local tmp_cf="${cf_bin}.tmp.$$"
+    rm -f "$tmp_cf"
+
+    for u in "${mirrors[@]}"; do
+        if fetch_file "$u" "$tmp_cf" && [[ -s "$tmp_cf" ]]; then
+            chmod +x "$tmp_cf" 2>/dev/null || true
+            if "$tmp_cf" --version >/dev/null 2>&1; then
+                mv -f "$tmp_cf" "$cf_bin"
+                chmod +x "$cf_bin" 2>/dev/null || true
+                success=1
+                break
+            fi
+        fi
+        rm -f "$tmp_cf" 2>/dev/null || true
+    done
+
+    if [[ "$success" -eq 1 ]]; then
+        log_info "cloudflared 穿透核心预下载成功并验证通过！"
+        if [[ "$(id -u 2>/dev/null || echo 1)" -eq 0 ]]; then
+            ln -sf "$cf_bin" /usr/local/bin/cloudflared 2>/dev/null || true
+        fi
+        return 0
+    else
+        log_warn "cloudflared 预下载未完成，将由运行时自动兜底。"
+        return 1
+    fi
+}
+
 # ── 安装 / 更新核心代码 ───────────────────────────────────────────────────────
 deploy_core() {
     nat64_enable_temp
@@ -964,6 +1024,9 @@ deploy_core() {
         npm_bin="$APP_DIR/node/bin/npm"
     fi
     "$npm_bin" install --omit=dev --silent 2>/dev/null || npm install --omit=dev --silent 2>/dev/null || true
+
+    # 预装 cloudflared 穿透核心（在 NAT64 活跃期间完成，避免后台运行时因纯 IPv6 无法连接 GitHub）
+    download_cloudflared || true
 
     # 下载最新实体脚本并更新全局快捷命令 (同时支持 argo 与短命令 ag)
     ensure_bin_path

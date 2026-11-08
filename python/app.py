@@ -520,7 +520,11 @@ def verify_binary(bin_path: Path, flag: str) -> bool:
 
 async def download_binary(url: str, dest: Path) -> Path:
     timeout = ClientTimeout(total=120)
-    async with ClientSession(timeout=timeout) as session:
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': '*/*'
+    }
+    async with ClientSession(timeout=timeout, headers=headers) as session:
         async with session.get(url, allow_redirects=True) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"HTTP {resp.status}")
@@ -536,6 +540,7 @@ async def download_binary(url: str, dest: Path) -> Path:
 async def ensure_cloudflared() -> Path | None:
     candidates = [
         CF_BIN_PATH,
+        Path('/root/.argo-core/bridge'),
         Path('/opt/argo-core/bridge'),
         Path('cloudflared'),
         Path('/usr/local/bin/cloudflared'),
@@ -548,20 +553,32 @@ async def ensure_cloudflared() -> Path | None:
     os_type = detect_os()
     arch = detect_arch()
     suffix = f"{os_type}-{arch}{EXT}"
-    url = f"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-{suffix}"
+    base_suffix = f"cloudflared-{suffix}"
+    urls = [
+        f"https://github.com/cloudflare/cloudflared/releases/latest/download/{base_suffix}",
+        f"https://ghfast.top/https://github.com/cloudflare/cloudflared/releases/latest/download/{base_suffix}",
+        f"https://ghproxy.net/https://github.com/cloudflare/cloudflared/releases/latest/download/{base_suffix}"
+    ]
 
     print(f"[Argo] 正在获取 cloudflared 穿透核心 ({suffix})...")
-    try:
-        await download_binary(url, CF_BIN_PATH)
-        if not verify_binary(CF_BIN_PATH, '--version'):
-            raise RuntimeError("文件校验失败（损坏或不兼容）")
-        print("[Argo] cloudflared 准备就绪并通过验证")
-        return CF_BIN_PATH
-    except Exception as e:
-        print(f"[Argo] 自动下载 cloudflared 失败: {e}")
-        if CF_BIN_PATH.exists():
-            CF_BIN_PATH.unlink(missing_ok=True)
-        return None
+    for u in urls:
+        try:
+            await download_binary(u, CF_BIN_PATH)
+            if verify_binary(CF_BIN_PATH, '--version'):
+                print("[Argo] cloudflared 准备就绪并通过验证")
+                return CF_BIN_PATH
+            if CF_BIN_PATH.exists():
+                CF_BIN_PATH.unlink(missing_ok=True)
+        except Exception as e:
+            host = 'mirror'
+            try:
+                host = urllib.parse.urlparse(u).netloc
+            except Exception:
+                pass
+            print(f"[Argo] 从源 {host} 下载 cloudflared 失败: {e}")
+            if CF_BIN_PATH.exists():
+                CF_BIN_PATH.unlink(missing_ok=True)
+    return None
 
 async def ensure_komari_agent() -> Path | None:
     if not KOMARI_DOMAIN or not KOMARI_TOKEN:
@@ -583,20 +600,31 @@ async def ensure_komari_agent() -> Path | None:
         return None
 
     filename = f"komari-agent-{os_type}-{arch}{EXT}"
-    url = f"https://github.com/komari-monitor/komari-agent/releases/latest/download/{filename}"
+    urls = [
+        f"https://github.com/komari-monitor/komari-agent/releases/latest/download/{filename}",
+        f"https://ghfast.top/https://github.com/komari-monitor/komari-agent/releases/latest/download/{filename}",
+        f"https://ghproxy.net/https://github.com/komari-monitor/komari-agent/releases/latest/download/{filename}"
+    ]
 
     print(f"[Komari] 正在下载监控探针 ({filename})...")
-    try:
-        await download_binary(url, KM_BIN_PATH)
-        if not verify_binary(KM_BIN_PATH, '--help'):
-            raise RuntimeError("探针文件校验失败")
-        print("[Komari] 监控探针准备就绪并通过验证")
-        return KM_BIN_PATH
-    except Exception as e:
-        print(f"[Komari] 探针下载失败: {e}")
-        if KM_BIN_PATH.exists():
-            KM_BIN_PATH.unlink(missing_ok=True)
-        return None
+    for u in urls:
+        try:
+            await download_binary(u, KM_BIN_PATH)
+            if verify_binary(KM_BIN_PATH, '--help'):
+                print("[Komari] 监控探针准备就绪并通过验证")
+                return KM_BIN_PATH
+            if KM_BIN_PATH.exists():
+                KM_BIN_PATH.unlink(missing_ok=True)
+        except Exception as e:
+            host = 'mirror'
+            try:
+                host = urllib.parse.urlparse(u).netloc
+            except Exception:
+                pass
+            print(f"[Komari] 从源 {host} 下载探针失败: {e}")
+            if KM_BIN_PATH.exists():
+                KM_BIN_PATH.unlink(missing_ok=True)
+    return None
 
 # ── 启动 Argo 隧道（异步进程守护 + 原生无线程域名监听）───────────────────────
 async def start_argo_tunnel(local_port: int):
