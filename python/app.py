@@ -1148,7 +1148,7 @@ async def handle_xhttp_get_common(request, protocol: str):
 
     try:
         while not sess['closed']:
-            if request.transport and request.transport.is_closing():
+            if request.transport is None or request.transport.is_closing():
                 break
             try:
                 data = await asyncio.wait_for(sess['downlink_queue'].get(), timeout=1.0)
